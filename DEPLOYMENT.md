@@ -55,6 +55,48 @@ Verify installation:
 az --version
 ```
 
+### Login to Azure (Git Bash on Windows 11)
+
+If using **Git Bash**, login with device code authentication:
+
+```bash
+# Open Git Bash and run:
+az login --use-device-code
+
+# Follow the prompt: copy the device code and visit https://microsoft.com/devicelogin
+# Paste the code and authenticate in your browser
+```
+
+**Common Issues & Fixes:**
+
+1. **"No subscription found" error**
+   ```bash
+   # List available subscriptions
+   az account list --output table
+   
+   # Set default subscription
+   az account set --subscription "YOUR_SUBSCRIPTION_ID"
+   ```
+
+2. **"az command not found" in Git Bash**
+   - Ensure Azure CLI is in your PATH
+   - Restart Git Bash after installation
+   - Verify: `which az`
+
+3. **PowerShell cmdlet compatibility in Bash**
+   - Use lowercase `az` commands (not `Az-*` cmdlets)
+   - Replace `$env:VAR_NAME` with `$VAR_NAME`
+   - Replace `$()` with `` $(command) ``
+
+4. **Authentication token issues**
+   ```bash
+   # Clear cached credentials
+   az account clear
+   
+   # Login again
+   az login --use-device-code
+   ```
+
 For official instructions see: https://docs.microsoft.com/cli/azure/install-azure-cli
 
 ### Install Docker
@@ -92,6 +134,49 @@ docker --version
 
 For official instructions see: https://docs.docker.com/get-docker/
 
+## Step 0: Create Resource Group & Register Providers
+
+### 0.1 Create Resource Group
+
+Before creating any Azure resources, you must create a resource group to contain them:
+
+```bash
+# Create resource group
+az group create \
+  --name vavilon-rg \
+  --location westeurope
+
+# Verify it was created
+az group list --output table
+```
+
+**Alternative regions:** `eastus`, `westus`, `eastus2`, `westus2`, `northeurope`, `westeurope` (using: `westeurope`)
+
+### 0.2 Register Resource Providers
+
+Register the required Azure resource providers (this can take a few minutes):
+
+```bash
+# Register providers required for this deployment
+az provider register --namespace Microsoft.Cache
+az provider register --namespace Microsoft.CognitiveServices
+az provider register --namespace Microsoft.Web
+az provider register --namespace Microsoft.ContainerInstance
+az provider register --namespace Microsoft.App
+
+# Check registration status (look for "RegistrationState: Registered")
+az provider show --namespace Microsoft.Cache --query "registrationState"
+az provider show --namespace Microsoft.CognitiveServices --query "registrationState"
+```
+
+**If you see "Registering"**, wait 5-10 minutes and check again. You cannot proceed until all show `"Registered"`.
+
+If subscription quota check is needed:
+
+```bash
+az account show --output table
+```
+
 ## Step 1: Create Azure Resources
 
 ### 1.1 Speech Service
@@ -102,7 +187,7 @@ az cognitiveservices account create \
   --resource-group vavilon-rg \
   --kind SpeechServices \
   --sku S0 \
-  --location eastus
+  --location westeurope
 
 # Get credentials
 az cognitiveservices account keys list \
@@ -116,7 +201,7 @@ az cognitiveservices account keys list \
 az redis create \
   --name vavilon-redis \
   --resource-group vavilon-rg \
-  --location eastus \
+  --location westeurope \
   --sku Basic \
   --vm-size c0
 
@@ -177,7 +262,7 @@ az container create \
   --environment-variables \
     PORT=5000 \
     AZURE_SPEECH_KEY=<your-key> \
-    AZURE_SPEECH_REGION=eastus \
+    AZURE_SPEECH_REGION=westeurope \
     NODE_BACKEND_URL=https://vavilon-backend.azurewebsites.net
 ```
 
@@ -239,7 +324,7 @@ az webapp config set \
 az staticwebapp create \
   --name vavilon-app \
   --resource-group vavilon-rg \
-  --location eastus2 \
+  --location westeurope \
   --source https://github.com/yourorg/vavilon \
   --branch main \
   --app-location "/frontend" \
@@ -320,16 +405,26 @@ async function getSession(idOrCode) {
 
 ## Step 6: Configure DNS and SSL
 
-### 6.1 Custom Domain (Optional)
+### 6.1 Custom Domain
+
+Your domain: `vavilonsolutions.com`
 
 ```bash
-# Add custom domain
+# Add custom domain to Static Web App
 az staticwebapp hostname set \
   --name vavilon-app \
-  --hostname app.vavilon.com
+  --hostname app.vavilonsolutions.com
 
 # SSL is automatic with Azure Static Web Apps
 ```
+
+**Verify DNS:**
+1. Go to Azure Portal → Static Web Apps → vavilon-app → Custom domains
+2. Copy the CNAME target value
+3. Add DNS record in your domain registrar:
+   - Type: CNAME
+   - Name: `app`
+   - Value: `<copy-from-azure-portal>`
 
 ### 6.2 CORS Configuration
 
@@ -347,7 +442,7 @@ az webapp cors add \
 ```bash
 az monitor app-insights component create \
   --app vavilon-insights \
-  --location eastus \
+  --location westeurope \
   --resource-group vavilon-rg
 
 # Get instrumentation key
@@ -436,7 +531,7 @@ Store secrets in Azure Key Vault:
 az keyvault create \
   --name vavilon-keyvault \
   --resource-group vavilon-rg \
-  --location eastus
+  --location westeurope
 
 az keyvault secret set \
   --vault-name vavilon-keyvault \
