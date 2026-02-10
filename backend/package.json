@@ -1,0 +1,21 @@
+{
+  "name": "vavilon-backend",
+  "version": "1.0.0",
+  "description": "Node.js backend for Vavilon translation service",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "qrcode": "^1.5.3",
+    "axios": "^1.6.7",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}

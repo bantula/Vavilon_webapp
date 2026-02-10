@@ -1,0 +1,9 @@
+{
+  "name": "vavilon-ai-service",
+  "version": "1.0.0",
+  "description": "Python AI service for speech translation",
+  "scripts": {
+    "dev": "python src/app.py",
+    "start": "python src/app.py"
+  }
+}
