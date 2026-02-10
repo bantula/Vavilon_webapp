@@ -22,6 +22,76 @@ Azure Redis Cache (Sessions)
 - Docker installed (for AI service)
 - GitHub account (for CI/CD)
 
+### Install Azure CLI
+
+Windows (PowerShell / winget):
+
+```powershell
+# Using winget (recommended)
+winget install --id Microsoft.AzureCLI -e
+
+# Or via MSI (run as Administrator)
+Invoke-WebRequest -Uri https://aka.ms/installazurecliwindows -OutFile .\AzureCLI.msi
+Start-Process msiexec.exe -Wait -ArgumentList '/I AzureCLI.msi /quiet'
+Remove-Item .\AzureCLI.msi
+```
+
+macOS (Homebrew):
+
+```bash
+brew update
+brew install azure-cli
+```
+
+Ubuntu / Debian:
+
+```bash
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+```
+
+Verify installation:
+
+```bash
+az --version
+```
+
+For official instructions see: https://docs.microsoft.com/cli/azure/install-azure-cli
+
+### Install Docker
+
+Windows (Docker Desktop / winget):
+
+```powershell
+# Install via winget (requires Windows 10/11)
+winget install --id Docker.DockerDesktop -e
+
+# After install: enable WSL2 and virtualization if required, then sign in to Docker Desktop.
+```
+
+macOS:
+
+```bash
+brew install --cask docker
+```
+
+Ubuntu / Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+# Optional: allow current user to run docker without sudo
+sudo usermod -aG docker $USER
+```
+
+Verify installation:
+
+```bash
+docker --version
+```
+
+For official instructions see: https://docs.docker.com/get-docker/
+
 ## Step 1: Create Azure Resources
 
 ### 1.1 Speech Service
