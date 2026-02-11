@@ -102,7 +102,7 @@ function handleBinaryMessage(connectionId, buffer) {
  */
 async function handleSpeakerJoin(connectionId, payload) {
   const { sessionId } = payload;
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
 
   if (!session) {
     sendError(connectionId, 'Session not found');
@@ -113,7 +113,7 @@ async function handleSpeakerJoin(connectionId, payload) {
   conn.sessionId = sessionId;
   conn.role = 'speaker';
 
-  setSpeakerConnected(sessionId, true);
+  await setSpeakerConnected(sessionId, true);
 
   // Notify speaker of successful join
   sendMessage(connectionId, {
@@ -134,7 +134,7 @@ async function handleListenerJoin(connectionId, payload) {
   const { sessionId, joinCode, language } = payload;
 
   // Get session by ID or join code
-  const session = getSession(sessionId || joinCode);
+  const session = await getSession(sessionId || joinCode);
 
   if (!session) {
     sendError(connectionId, 'Session not found');
@@ -151,7 +151,7 @@ async function handleListenerJoin(connectionId, payload) {
   conn.role = 'listener';
   conn.language = language;
 
-  addListener(session.id, connectionId, language);
+  await addListener(session.id, connectionId, language);
 
   // Notify listener of successful join
   sendMessage(connectionId, {
@@ -197,8 +197,8 @@ async function forwardAudioToAI(sessionId, audioData) {
  * Broadcast translated audio and subtitles to listeners
  * Called by AI service webhook or polling
  */
-function broadcastToListeners(sessionId, language, audioData, subtitleText) {
-  const listenerIds = getListenersByLanguage(sessionId, language);
+async function broadcastToListeners(sessionId, language, audioData, subtitleText) {
+  const listenerIds = await getListenersByLanguage(sessionId, language);
 
   listenerIds.forEach(connectionId => {
     const conn = connections.get(connectionId);
@@ -233,23 +233,23 @@ function broadcastToListeners(sessionId, language, audioData, subtitleText) {
 /**
  * Handle speaker disconnect
  */
-function handleSpeakerDisconnect(connectionId) {
+async function handleSpeakerDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
 
-  setSpeakerConnected(conn.sessionId, false);
+  await setSpeakerConnected(conn.sessionId, false);
 
   // Notify all listeners that speaker disconnected
-  const session = getSession(conn.sessionId);
-  if (session) {
-    session.listeners.forEach((listeners, language) => {
+  const session = await getSession(conn.sessionId);
+  if (session && session.listeners) {
+    for (const [language, listeners] of Object.entries(session.listeners)) {
       listeners.forEach(listenerId => {
         sendMessage(listenerId, {
           type: 'speaker_disconnected',
           payload: {}
         });
       });
-    });
+    }
   }
 
   console.log(`✓ Speaker disconnected from session: ${conn.sessionId}`);
@@ -258,14 +258,14 @@ function handleSpeakerDisconnect(connectionId) {
 /**
  * Handle connection disconnect
  */
-function handleDisconnect(connectionId) {
+async function handleDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
 
   if (conn.role === 'speaker') {
-    handleSpeakerDisconnect(connectionId);
+    await handleSpeakerDisconnect(connectionId);
   } else if (conn.role === 'listener') {
-    removeListener(conn.sessionId, connectionId, conn.language);
+    await removeListener(conn.sessionId, connectionId, conn.language);
   }
 
   connections.delete(connectionId);

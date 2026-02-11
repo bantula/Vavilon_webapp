@@ -7,7 +7,7 @@ const { broadcastToListeners } = require('../websocket/wsHandler');
  * Receive translated audio and subtitles from AI service
  * Broadcast to all listeners for that language
  */
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   try {
     const { sessionId, language, audioData, subtitleText } = req.body;
 
@@ -19,7 +19,7 @@ router.post('/', (req, res) => {
     }
 
     // Broadcast to all listeners of this language
-    broadcastToListeners(sessionId, language, audioData, subtitleText);
+    await broadcastToListeners(sessionId, language, audioData, subtitleText);
 
     res.json({
       success: true,

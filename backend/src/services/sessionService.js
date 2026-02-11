@@ -1,8 +1,28 @@
 const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
+const redis = require('redis');
 
-// In-memory session store (use Redis in production)
-const sessions = new Map();
+// Redis client for session storage
+const client = redis.createClient({
+  url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
+  password: process.env.REDIS_PASSWORD,
+  socket: {
+    tls: process.env.REDIS_URL ? true : false,
+    rejectUnauthorized: false
+  }
+});
+
+client.on('error', (err) => console.error('Redis Client Error', err));
+client.on('connect', () => console.log('✓ Connected to Redis'));
+
+// Connect to Redis
+(async () => {
+  try {
+    await client.connect();
+  } catch (err) {
+    console.error('Failed to connect to Redis:', err);
+  }
+})();
 
 /**
  * Generate a short 6-character join code
@@ -32,15 +52,16 @@ async function createSession() {
     joinCode,
     qrCode: qrCodeDataUrl,
     joinUrl,
-    createdAt: new Date(),
+    createdAt: new Date().toISOString(),
     isActive: true,
     speakerConnected: false,
-    listeners: new Map(), // languageCode -> Set of connectionIds
+    listeners: {}, // languageCode -> array of connectionIds
     supportedLanguages: ['en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'zh', 'ja', 'ar']
   };
 
-  sessions.set(sessionId, session);
-  sessions.set(joinCode, sessionId); // Map code to ID for quick lookup
+  // Store in Redis with 24 hour expiration
+  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
+  await client.setEx(`code:${joinCode}`, 86400, sessionId);
 
   console.log(`✓ Session created: ${sessionId} | Code: ${joinCode}`);
 
@@ -56,28 +77,44 @@ async function createSession() {
 /**
  * Get session by ID or join code
  */
-function getSession(idOrCode) {
-  // Check if it's a join code first
-  if (sessions.has(idOrCode) && typeof sessions.get(idOrCode) === 'string') {
-    const sessionId = sessions.get(idOrCode);
-    return sessions.get(sessionId);
+async function getSession(idOrCode) {
+  try {
+    // Try as session ID first
+    const sessionData = await client.get(`session:${idOrCode}`);
+    if (sessionData) {
+      return JSON.parse(sessionData);
+    }
+
+    // Try as join code
+    const sessionId = await client.get(`code:${idOrCode}`);
+    if (sessionId) {
+      const session = await client.get(`session:${sessionId}`);
+      return session ? JSON.parse(session) : null;
+    }
+
+    return null;
+  } catch (err) {
+    console.error('Error getting session:', err);
+    return null;
   }
-  // Otherwise treat as session ID
-  return sessions.get(idOrCode);
 }
 
 /**
  * Add listener to session
  */
-function addListener(sessionId, connectionId, language) {
-  const session = sessions.get(sessionId);
+async function addListener(sessionId, connectionId, language) {
+  const session = await getSession(sessionId);
   if (!session) return false;
 
-  if (!session.listeners.has(language)) {
-    session.listeners.set(language, new Set());
+  if (!session.listeners[language]) {
+    session.listeners[language] = [];
   }
 
-  session.listeners.get(language).add(connectionId);
+  if (!session.listeners[language].includes(connectionId)) {
+    session.listeners[language].push(connectionId);
+  }
+
+  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
   console.log(`✓ Listener ${connectionId} joined session ${sessionId} (${language})`);
 
   return true;
@@ -86,53 +123,54 @@ function addListener(sessionId, connectionId, language) {
 /**
  * Remove listener from session
  */
-function removeListener(sessionId, connectionId, language) {
-  const session = sessions.get(sessionId);
+async function removeListener(sessionId, connectionId, language) {
+  const session = await getSession(sessionId);
   if (!session) return;
 
-  if (session.listeners.has(language)) {
-    session.listeners.get(language).delete(connectionId);
+  if (session.listeners[language]) {
+    session.listeners[language] = session.listeners[language].filter(id => id !== connectionId);
 
-    // Clean up empty language sets
-    if (session.listeners.get(language).size === 0) {
-      session.listeners.delete(language);
+    // Clean up empty language arrays
+    if (session.listeners[language].length === 0) {
+      delete session.listeners[language];
     }
   }
 
+  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
   console.log(`✓ Listener ${connectionId} left session ${sessionId}`);
 }
 
 /**
  * Get all listener connection IDs for a specific language in a session
  */
-function getListenersByLanguage(sessionId, language) {
-  const session = sessions.get(sessionId);
-  if (!session || !session.listeners.has(language)) {
+async function getListenersByLanguage(sessionId, language) {
+  const session = await getSession(sessionId);
+  if (!session || !session.listeners[language]) {
     return [];
   }
-  return Array.from(session.listeners.get(language));
+  return session.listeners[language];
 }
 
 /**
  * Set speaker connection status
  */
-function setSpeakerConnected(sessionId, connected) {
-  const session = sessions.get(sessionId);
+async function setSpeakerConnected(sessionId, connected) {
+  const session = await getSession(sessionId);
   if (session) {
     session.speakerConnected = connected;
+    await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
   }
 }
 
 /**
  * End session and cleanup
  */
-function endSession(sessionId) {
-  const session = sessions.get(sessionId);
+async function endSession(sessionId) {
+  const session = await getSession(sessionId);
   if (!session) return;
 
-  session.isActive = false;
-  sessions.delete(session.joinCode);
-  sessions.delete(sessionId);
+  await client.del(`session:${sessionId}`);
+  await client.del(`code:${session.joinCode}`);
 
   console.log(`✓ Session ended: ${sessionId}`);
 }
@@ -140,15 +178,15 @@ function endSession(sessionId) {
 /**
  * Get session statistics
  */
-function getSessionStats(sessionId) {
-  const session = sessions.get(sessionId);
+async function getSessionStats(sessionId) {
+  const session = await getSession(sessionId);
   if (!session) return null;
 
   let totalListeners = 0;
   const languageBreakdown = {};
 
-  session.listeners.forEach((listeners, language) => {
-    const count = listeners.size;
+  Object.entries(session.listeners).forEach(([language, listeners]) => {
+    const count = listeners.length;
     totalListeners += count;
     languageBreakdown[language] = count;
   });

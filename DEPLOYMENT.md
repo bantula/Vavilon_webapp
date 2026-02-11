@@ -317,6 +317,7 @@ az webapp config appsettings set \
     AI_SERVICE_URL=https://vavilon-ai.westeurope.azurecontainer.io:5000 \
     FRONTEND_URL=https://vavilon-app.azurestaticapps.net \
     REDIS_URL=vavilon-redis.redis.cache.windows.net \
+    REDIS_PASSWORD="<paste-primary-key-from-step-1.2>" \
     SCM_DO_BUILD_DURING_DEPLOYMENT=true
 
 # Set explicit startup command
@@ -326,8 +327,11 @@ az webapp config set \
   --startup-file "node src/index.js"
 ```
 
-**Important:** `SCM_DO_BUILD_DURING_DEPLOYMENT=true` tells Azure's Oryx build system to run
+**Important:** 
+- `SCM_DO_BUILD_DURING_DEPLOYMENT=true` tells Azure's Oryx build system to run
 `npm install` after extracting the zip. Without this, your zip has no `node_modules` and the
+deployment will fail with a 400 error.
+- Replace `<paste-primary-key-from-step-1.2>` with the primary key from `az redis list-keys` in Step 1.2
 deployment will fail with a 400 error.
 
 ### 3.3 Deploy Code
@@ -391,110 +395,98 @@ az webapp config set \
 ### 4.1 Create Static Web App
 
 ```bash
+# Authenticate with GitHub (opens browser)
 az staticwebapp create \
   --name vavilon-app \
   --resource-group vavilon-rg \
   --location westeurope \
-  --source https://github.com/yourorg/vavilon \
+  --source https://github.com/bantula/Vavilon_webapp \
   --branch main \
   --app-location "/frontend" \
-  --output-location "dist"
+  --output-location "dist" \
+  --login-with-github
 ```
+
+This will:
+1. Open your browser to authenticate with GitHub
+2. Azure will create a GitHub Actions workflow in your repo
+3. Every push to `main` branch will automatically deploy
 
 ### 4.2 Configure Build
 
-Update `frontend/vite.config.js`:
+The `frontend/vite.config.js` is already configured to work for both local development and production.
 
-```javascript
-export default defineConfig({
-  plugins: [react()],
-  build: {
-    outDir: 'dist'
-  },
-  server: {
-    proxy: {
-      '/api': {
-        target: 'https://vavilon-backend.azurewebsites.net',
-        changeOrigin: true
-      },
-      '/ws': {
-        target: 'wss://vavilon-backend.azurewebsites.net',
-        ws: true
-      }
-    }
-  }
-})
-```
+**No changes needed** - the file uses environment variables that automatically switch between:
+- **Local development**: `http://localhost:3000` 
+- **Production**: Azure URLs (set by GitHub Actions during deployment)
 
-### 4.3 Build and Deploy
+### 4.3 Deploy (Automatic via GitHub Actions)
 
-```bash
-cd frontend
-npm run build
+Once step 4.1 completes, Azure automatically creates a GitHub Actions workflow in your repo.
 
-# Deploy via Azure Static Web Apps CLI
-npm install -g @azure/static-web-apps-cli
-swa deploy ./dist \
-  --app-name vavilon-app \
-  --resource-group vavilon-rg
-```
+**Deployment is now automatic** - every time you push to the `main` branch, GitHub Actions will:
+1. Build your frontend (`npm run build`)
+2. Deploy to Azure Static Web Apps
+3. You can monitor deployments at: https://github.com/bantula/Vavilon_webapp/actions
+
+**No manual deployment needed!** 🎉
 
 ## Step 5: Update Session Storage (Redis)
 
-Update `backend/src/services/sessionService.js`:
+✓ **Already completed!** The backend code has been updated to use Redis instead of in-memory storage.
 
-```javascript
-const redis = require('redis');
+**Changes made:**
+- Added `redis` package to [backend/package.json](backend/package.json)
+- Updated [backend/src/services/sessionService.js](backend/src/services/sessionService.js) to use Redis
+- Updated all routes and websocket handlers to handle async Redis operations
+- Sessions now persist across server restarts with 24-hour expiration
 
-const client = redis.createClient({
-  url: process.env.REDIS_URL
-});
-
-client.connect();
-
-// Replace Map with Redis
-async function createSession() {
-  // ... existing code ...
-  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
-  await client.setEx(`code:${joinCode}`, 86400, sessionId);
-  return session;
-}
-
-async function getSession(idOrCode) {
-  const sessionData = await client.get(`session:${idOrCode}`);
-  if (sessionData) return JSON.parse(sessionData);
-
-  const sessionId = await client.get(`code:${idOrCode}`);
-  if (sessionId) {
-    const session = await client.get(`session:${sessionId}`);
-    return JSON.parse(session);
-  }
-  return null;
-}
-```
+**Next step:** Redeploy your backend (repeat Step 3.3) to apply these changes.
 
 ## Step 6: Configure DNS and SSL
 
 ### 6.1 Custom Domain
 
-Your domain: `vavilonsolutions.com`
+Your domain: `vavilonapp.rs`
 
 ```bash
-# Add custom domain to Static Web App
+# Add custom domain to Static Web App (for www subdomain)
 az staticwebapp hostname set \
   --name vavilon-app \
-  --hostname app.vavilonsolutions.com
+  --hostname www.vavilonapp.rs
+
+# Or for root domain
+az staticwebapp hostname set \
+  --name vavilon-app \
+  --hostname vavilonapp.rs
 
 # SSL is automatic with Azure Static Web Apps
 ```
 
-**Verify DNS:**
+**Configure DNS at your domain registrar (.rs):**
+
 1. Go to Azure Portal → Static Web Apps → vavilon-app → Custom domains
-2. Copy the CNAME target value
-3. Add DNS record in your domain registrar:
+2. Click "Add" and enter your domain
+3. Azure will show you the validation record
+4. In your domain registrar's DNS settings, add:
+
+   **For www subdomain:**
    - Type: CNAME
-   - Name: `app`
-   - Value: `<copy-from-azure-portal>`
+   - Name: `www`
+   - Value: `<your-static-app>.azurestaticapps.net`
+
+   **For root domain (vavilonapp.rs):**
+   - Type: ALIAS or ANAME (if supported by .rs registrar)
+   - Name: `@`
+   - Value: `<your-static-app>.azurestaticapps.net`
+   
+   OR if ALIAS not supported:
+   - Type: A
+   - Name: `@`
+   - Value: Get IP via `nslookup <your-static-app>.azurestaticapps.net`
+
+5. Wait 10-60 minutes for DNS propagation
+6. Verify with: `nslookup vavilonapp.rs`
 
 ### 6.2 CORS Configuration
 
@@ -503,6 +495,12 @@ az webapp cors add \
   --name vavilon-backend \
   --resource-group vavilon-rg \
   --allowed-origins https://vavilon-app.azurestaticapps.net
+
+# After custom domain is configured, also add:
+az webapp cors add \
+  --name vavilon-backend \
+  --resource-group vavilon-rg \
+  --allowed-origins https://vavilonapp.rs
 ```
 
 ## Step 7: Monitoring and Logging

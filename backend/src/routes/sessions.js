@@ -31,61 +31,85 @@ router.post('/', async (req, res) => {
  * GET /api/sessions/:idOrCode
  * Get session details by ID or join code
  */
-router.get('/:idOrCode', (req, res) => {
-  const { idOrCode } = req.params;
-  const session = getSession(idOrCode);
+router.get('/:idOrCode', async (req, res) => {
+  try {
+    const { idOrCode } = req.params;
+    const session = await getSession(idOrCode);
 
-  if (!session) {
-    return res.status(404).json({
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: 'Session not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      session: {
+        id: session.id,
+        joinCode: session.joinCode,
+        isActive: session.isActive,
+        supportedLanguages: session.supportedLanguages
+      }
+    });
+  } catch (error) {
+    console.error('Error getting session:', error);
+    res.status(500).json({
       success: false,
-      error: 'Session not found'
+      error: 'Failed to get session'
     });
   }
-
-  res.json({
-    success: true,
-    session: {
-      id: session.id,
-      joinCode: session.joinCode,
-      isActive: session.isActive,
-      supportedLanguages: session.supportedLanguages
-    }
-  });
 });
 
 /**
  * GET /api/sessions/:id/stats
  * Get session statistics
  */
-router.get('/:id/stats', (req, res) => {
-  const { id } = req.params;
-  const stats = getSessionStats(id);
+router.get('/:id/stats', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const stats = await getSessionStats(id);
 
-  if (!stats) {
-    return res.status(404).json({
+    if (!stats) {
+      return res.status(404).json({
+        success: false,
+        error: 'Session not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      stats
+    });
+  } catch (error) {
+    console.error('Error getting session stats:', error);
+    res.status(500).json({
       success: false,
-      error: 'Session not found'
+      error: 'Failed to get session stats'
     });
   }
-
-  res.json({
-    success: true,
-    stats
-  });
 });
 
 /**
  * DELETE /api/sessions/:id
  * End a session
  */
-router.delete('/:id', (req, res) => {
-  const { id } = req.params;
-  endSession(id);
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await endSession(id);
 
-  res.json({
-    success: true,
-    message: 'Session ended'
-  });
+    res.json({
+      success: true,
+      message: 'Session ended'
+    });
+  } catch (error) {
+    console.error('Error ending session:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to end session'
+    });
+  }
 });
 
 module.exports = router;
