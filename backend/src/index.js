@@ -1,3 +1,15 @@
+// Initialize Application Insights first
+const appInsights = require('applicationinsights');
+if (process.env.APPINSIGHTS_INSTRUMENTATIONKEY) {
+  appInsights.setup(process.env.APPINSIGHTS_INSTRUMENTATIONKEY)
+    .setAutoDependencyCorrelation(true)
+    .setAutoCollectRequests(true)
+    .setAutoCollectPerformance(true)
+    .setAutoCollectExceptions(true)
+    .start();
+  console.log('✓ Application Insights enabled');
+}
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');

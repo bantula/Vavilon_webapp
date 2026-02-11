@@ -37,6 +37,11 @@ logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.zip
+
+# Deployment artifacts and secrets
+deploy.zip
+*-publish-profile.xml
 
 # Testing
 coverage/

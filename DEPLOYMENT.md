@@ -164,11 +164,15 @@ az provider register --namespace Microsoft.ContainerRegistry
 az provider register --namespace Microsoft.Web
 az provider register --namespace Microsoft.ContainerInstance
 az provider register --namespace Microsoft.App
+az provider register --namespace Microsoft.Insights
+az provider register --namespace Microsoft.OperationalInsights
 
 # Check registration status (look for "RegistrationState: Registered")
 az provider show --namespace Microsoft.Cache --query "registrationState"
 az provider show --namespace Microsoft.CognitiveServices --query "registrationState"
 az provider show --namespace Microsoft.ContainerRegistry --query "registrationState"
+az provider show --namespace Microsoft.Insights --query "registrationState"
+az provider show --namespace Microsoft.OperationalInsights --query "registrationState"
 ```
 
 **If you see "Registering"**, wait 5-10 minutes and check again. You cannot proceed until all show `"Registered"`.
