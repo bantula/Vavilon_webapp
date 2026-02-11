@@ -39,11 +39,20 @@ jobs:
           "
       
       - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v2
-        with:
-          app-name: vavilon-backend
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          package: backend/deploy.zip
+        env:
+          PUBLISH_PROFILE: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        run: |
+          # Extract deployment credentials from publish profile
+          USERNAME=$(echo "$PUBLISH_PROFILE" | grep -oP 'userName="[^"]*' | grep -oP '".*' | tr -d '"' | head -1)
+          PASSWORD=$(echo "$PUBLISH_PROFILE" | grep -oP 'userPWD="[^"]*' | grep -oP '".*' | tr -d '"' | head -1)
+          
+          # Deploy using Kudu API
+          curl -X POST \
+            -u "$USERNAME:$PASSWORD" \
+            --data-binary @deploy.zip \
+            https://vavilon-backend.scm.azurewebsites.net/api/zipdeploy \
+            -H "Content-Type: application/octet-stream" \
+            -w "\nHTTP Status: %{http_code}\n"
 
   deploy-ai:
     runs-on: ubuntu-latest
