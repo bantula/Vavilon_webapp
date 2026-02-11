@@ -616,14 +616,23 @@ az keyvault secret set \
 Enable managed identity for App Service:
 
 ```bash
+# Enable managed identity and capture the principal ID
 az webapp identity assign \
   --name vavilon-backend \
   --resource-group vavilon-rg
 
-# Grant access to Key Vault
+# Get the principal ID (you'll need this for the next command)
+PRINCIPAL_ID=$(az webapp identity show \
+  --name vavilon-backend \
+  --resource-group vavilon-rg \
+  --query principalId -o tsv)
+
+echo "Principal ID: $PRINCIPAL_ID"
+
+# Grant access to Key Vault using the principal ID
 az keyvault set-policy \
   --name vavilon-keyvault \
-  --object-id <identity-principal-id> \
+  --object-id "$PRINCIPAL_ID" \
   --secret-permissions get list
 ```
 

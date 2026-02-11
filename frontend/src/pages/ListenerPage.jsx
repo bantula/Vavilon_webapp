@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import config from '../config'
 
 const LANGUAGES = [
   { code: 'en', name: 'English' },
@@ -69,8 +70,8 @@ function ListenerPage() {
   }
 
   const setupWebSocket = (sessionId) => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/ws`
+    const wsUrl = config.getWebSocketUrl()
+    console.log('Connecting to WebSocket:', wsUrl)
 
     wsRef.current = new WebSocket(wsUrl)
 

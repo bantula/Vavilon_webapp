@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useParams, useLocation, useNavigate } from 'react-router-dom'
 import { QRCodeSVG } from 'qrcode.react'
+import config from '../config'
 
 function SpeakerPage() {
   const { sessionId } = useParams()
@@ -64,8 +65,8 @@ function SpeakerPage() {
   }
 
   const setupWebSocket = () => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}/ws`
+    const wsUrl = config.getWebSocketUrl()
+    console.log('Connecting to WebSocket:', wsUrl)
 
     wsRef.current = new WebSocket(wsUrl)
 
