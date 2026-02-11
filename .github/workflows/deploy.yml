@@ -1,0 +1,67 @@
+name: Deploy Vavilon
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  deploy-backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      - name: Install dependencies
+        run: npm ci --no-workspaces
+      
+      - name: Create deployment package
+        run: |
+          python3 -c "
+          import zipfile, os
+          if os.path.exists('deploy.zip'): os.remove('deploy.zip')
+          with zipfile.ZipFile('deploy.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
+              zf.write('package.json', 'package.json')
+              zf.write('package-lock.json', 'package-lock.json')
+              for root, dirs, files in os.walk('src'):
+                  for f in files:
+                      fp = os.path.join(root, f)
+                      zf.write(fp, fp.replace(os.sep, '/'))
+          "
+      
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: vavilon-backend
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: backend/deploy.zip
+
+  deploy-ai:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: vavilonacr.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      
+      - name: Build and push Docker image
+        working-directory: ./ai-service
+        run: |
+          docker build -t vavilonacr.azurecr.io/vavilon-ai:latest .
+          docker push vavilonacr.azurecr.io/vavilon-ai:latest
+      
+      # Note: Container Instance will pull the latest image on next restart
+      # You can manually restart via: az container restart --name vavilon-ai --resource-group vavilon-rg
