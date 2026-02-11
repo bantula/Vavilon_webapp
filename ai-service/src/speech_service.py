@@ -1,317 +1,263 @@
 import azure.cognitiveservices.speech as speechsdk
-import io
 import base64
-from typing import Dict, List
-from pydub import AudioSegment
-import wave
+import queue
+import threading
+import requests
+import time
+from typing import Dict, Set
 
 
-class SpeechTranslationService:
+class TranslationSession:
     """
-    Azure Speech SDK wrapper for real-time translation
-    Handles: STT -> Translation -> TTS pipeline
+    A persistent translation session that mirrors dubber.py's architecture:
+    - PushAudioInputStream for streaming audio from the browser
+    - TranslationRecognizer with continuous recognition (STT + Translation in one step)
+    - SpeechSynthesizer per target language for TTS
     """
 
-    def __init__(self, subscription_key: str, region: str):
-        self.subscription_key = subscription_key
+    # Language codes for Azure Speech Translation (BCP-47 for translation targets)
+    TRANSLATION_LANG_MAP = {
+        'en': 'en',
+        'es': 'es',
+        'fr': 'fr',
+        'de': 'de',
+        'it': 'it',
+        'pt': 'pt',
+        'ru': 'ru',
+        'zh': 'zh-Hans',
+        'ja': 'ja',
+        'ar': 'ar'
+    }
+
+    # Full locale codes for TTS synthesis
+    TTS_LOCALE_MAP = {
+        'en': 'en-US',
+        'es': 'es-ES',
+        'fr': 'fr-FR',
+        'de': 'de-DE',
+        'it': 'it-IT',
+        'pt': 'pt-PT',
+        'ru': 'ru-RU',
+        'zh': 'zh-CN',
+        'ja': 'ja-JP',
+        'ar': 'ar-SA'
+    }
+
+    def __init__(self, session_id: str, speech_key: str, region: str,
+                 source_language: str, target_languages: list,
+                 node_backend_url: str):
+        self.session_id = session_id
+        self.speech_key = speech_key
         self.region = region
+        self.source_language = source_language
+        self.target_languages = set(target_languages)
+        self.node_backend_url = node_backend_url
 
-        # Supported target languages (Azure Speech SDK codes)
-        self.language_map = {
-            'en': 'en-US',
-            'es': 'es-ES',
-            'fr': 'fr-FR',
-            'de': 'de-DE',
-            'it': 'it-IT',
-            'pt': 'pt-PT',
-            'ru': 'ru-RU',
-            'zh': 'zh-CN',
-            'ja': 'ja-JP',
-            'ar': 'ar-SA'
-        }
+        self._stop_event = threading.Event()
 
-    def convert_to_wav(self, audio_bytes: bytes) -> bytes:
-        """
-        Convert any audio format (WebM, MP3, etc.) to WAV format required by Azure Speech SDK
-        Format: 16kHz, mono, 16-bit PCM
-        """
-        try:
-            # Load audio from bytes
-            audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-            
-            # Convert to required format: 16kHz, mono, 16-bit
-            audio = audio.set_frame_rate(16000)
-            audio = audio.set_channels(1)
-            audio = audio.set_sample_width(2)  # 2 bytes = 16-bit
-            
-            # Export as WAV
-            wav_buffer = io.BytesIO()
-            audio.export(wav_buffer, format="wav")
-            wav_buffer.seek(0)
-            
-            return wav_buffer.read()
-            
-        except Exception as e:
-            print(f"Error converting audio to WAV: {str(e)}")
-            # If conversion fails, return original bytes and hope for the best
-            return audio_bytes
+        # Audio input stream that we push browser audio into
+        self._audio_stream = speechsdk.audio.PushAudioInputStream(
+            stream_format=speechsdk.audio.AudioStreamFormat(
+                samples_per_second=16000,
+                bits_per_sample=16,
+                channels=1
+            )
+        )
 
-    def process_audio_stream(self, audio_bytes: bytes, session_id: str) -> Dict:
-        """
-        Process speaker audio:
-        1. Speech-to-Text (STT) - recognize original speech
-        2. Translation - translate to multiple target languages
-        3. Text-to-Speech (TTS) - synthesize translated speech
+        # Translation recognizer (STT + Translation combined, like dubber.py)
+        self._translation_recognizer = None
 
-        Returns:
-        {
-            'success': True/False,
-            'translations': {
-                'es': {'text': '...', 'audioData': 'base64...'},
-                'fr': {'text': '...', 'audioData': 'base64...'},
-                ...
-            }
-        }
-        """
-        try:
-            # Step 1: Speech-to-Text (STT)
-            recognized_text, source_language = self.recognize_speech(audio_bytes)
+        # Per-language text queues and synthesizers (mirrors dubber.py's pattern)
+        self._translated_text_queues: Dict[str, queue.Queue] = {}
+        self._synthesizers: Dict[str, speechsdk.SpeechSynthesizer] = {}
+        self._synth_threads: Dict[str, dict] = {}
 
-            if not recognized_text:
-                return {
-                    'success': False,
-                    'error': 'No speech recognized'
-                }
+        self._setup_recognizer()
+        self._setup_synthesizers()
 
-            print(f"✓ Recognized ({source_language}): {recognized_text}")
+    def _setup_recognizer(self):
+        """Setup TranslationRecognizer with continuous recognition - same pattern as dubber.py"""
+        translation_config = speechsdk.translation.SpeechTranslationConfig(
+            subscription=self.speech_key,
+            region=self.region
+        )
+        translation_config.speech_recognition_language = self.source_language
 
-            # Step 2 & 3: Translate and synthesize for each target language
-            translations = {}
+        # Add target languages for translation (like dubber.py line 612-613)
+        for lang in self.target_languages:
+            trans_code = self.TRANSLATION_LANG_MAP.get(lang, lang)
+            translation_config.add_target_language(trans_code)
 
-            # Get target languages (all except source)
-            target_languages = [lang for lang in self.language_map.keys()
-                                if lang != source_language[:2].lower()]
+        # Segmentation silence timeout for responsive recognition
+        translation_config.set_property(
+            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "500"
+        )
 
-            for target_lang in target_languages:
-                # Translate text
-                translated_text = self.translate_text(
-                    recognized_text,
-                    source_language,
-                    target_lang
-                )
+        audio_config = speechsdk.audio.AudioConfig(stream=self._audio_stream)
 
-                # Synthesize speech
-                audio_data = self.synthesize_speech(
-                    translated_text,
-                    target_lang
-                )
+        self._translation_recognizer = speechsdk.translation.TranslationRecognizer(
+            translation_config=translation_config,
+            audio_config=audio_config
+        )
 
-                translations[target_lang] = {
-                    'text': translated_text,
-                    'audioData': audio_data
-                }
+        # Connect callbacks (same pattern as dubber.py lines 732-760)
+        self._translation_recognizer.recognized.connect(self._on_recognized)
+        self._translation_recognizer.canceled.connect(self._on_canceled)
+        self._translation_recognizer.session_stopped.connect(self._on_session_stopped)
 
-                print(f"✓ Translated to {target_lang}: {translated_text[:50]}...")
+    def _setup_synthesizers(self):
+        """Create one SpeechSynthesizer per target language - same pattern as dubber.py lines 219-227"""
+        for lang in self.target_languages:
+            self._translated_text_queues[lang] = queue.Queue()
 
-            return {
-                'success': True,
-                'sourceText': recognized_text,
-                'sourceLanguage': source_language,
-                'translations': translations
-            }
-
-        except Exception as e:
-            print(f"Error in process_audio_stream: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e)
-            }
-
-    def recognize_speech(self, audio_bytes: bytes) -> tuple:
-        """
-        Perform Speech-to-Text using Azure Speech SDK
-        Returns: (recognized_text, detected_language)
-        """
-        try:
-            # Convert audio to WAV format (16kHz, mono, 16-bit PCM) required by Azure Speech SDK
-            wav_data = self.convert_to_wav(audio_bytes)
-            
-            # Create speech config
             speech_config = speechsdk.SpeechConfig(
-                subscription=self.subscription_key,
+                subscription=self.speech_key,
                 region=self.region
             )
-
-            # Auto-detect language (supports multiple languages)
-            auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
-                languages=list(self.language_map.values())
-            )
-
-            # Create audio config from WAV bytes
-            audio_stream = speechsdk.audio.PushAudioInputStream()
-            audio_stream.write(wav_data)
-            audio_stream.close()
-
-            audio_config = speechsdk.audio.AudioConfig(stream=audio_stream)
-
-            # Create speech recognizer
-            recognizer = speechsdk.SpeechRecognizer(
-                speech_config=speech_config,
-                auto_detect_source_language_config=auto_detect_config,
-                audio_config=audio_config
-            )
-
-            # Recognize speech
-            result = recognizer.recognize_once()
-
-            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                detected_language = result.properties.get(
-                    speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult,
-                    'en-US'
-                )
-                return result.text, detected_language
-            else:
-                print(f"Speech recognition failed: {result.reason}")
-                return None, None
-
-        except Exception as e:
-            print(f"Error in recognize_speech: {str(e)}")
-            return None, None
-
-    def translate_text(self, text: str, source_lang: str, target_lang: str) -> str:
-        """
-        Translate text using Azure Translator
-        For MVP, using Azure Speech SDK translation capabilities
-        """
-        try:
-            # Create translation config
-            translation_config = speechsdk.translation.SpeechTranslationConfig(
-                subscription=self.subscription_key,
-                region=self.region
-            )
-
-            # Set source language
-            translation_config.speech_recognition_language = source_lang
-
-            # Add target language
-            target_lang_code = self.language_map.get(target_lang, 'en-US')
-            translation_config.add_target_language(target_lang_code)
-
-            # For text-only translation, we use the same approach
-            # In production, consider Azure Translator Text API for better text translation
-
-            # For MVP, return simulated translation
-            # TODO: Integrate Azure Translator Text API for production
-            return f"[{target_lang.upper()}] {text}"
-
-        except Exception as e:
-            print(f"Error in translate_text: {str(e)}")
-            return text
-
-    def synthesize_speech(self, text: str, language: str) -> str:
-        """
-        Perform Text-to-Speech using Azure Speech SDK
-        Returns: base64-encoded audio data
-        """
-        try:
-            # Create speech config
-            speech_config = speechsdk.SpeechConfig(
-                subscription=self.subscription_key,
-                region=self.region
-            )
-
-            # Set target language and voice
-            lang_code = self.language_map.get(language, 'en-US')
-            speech_config.speech_synthesis_language = lang_code
-
-            # Use default voice for language
-            # Map to neural voices for better quality
-            voice_map = {
-                'en-US': 'en-US-JennyNeural',
-                'es-ES': 'es-ES-ElviraNeural',
-                'fr-FR': 'fr-FR-DeniseNeural',
-                'de-DE': 'de-DE-KatjaNeural',
-                'it-IT': 'it-IT-ElsaNeural',
-                'pt-PT': 'pt-PT-RaquelNeural',
-                'ru-RU': 'ru-RU-SvetlanaNeural',
-                'zh-CN': 'zh-CN-XiaoxiaoNeural',
-                'ja-JP': 'ja-JP-NanamiNeural',
-                'ar-SA': 'ar-SA-ZariyahNeural'
-            }
-
-            speech_config.speech_synthesis_voice_name = voice_map.get(
-                lang_code,
-                'en-US-JennyNeural'
-            )
-
-            # Set audio format (MP3 for streaming)
-            speech_config.set_speech_synthesis_output_format(
-                speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3
-            )
-
-            # Create synthesizer with null output (we'll capture the audio)
-            synthesizer = speechsdk.SpeechSynthesizer(
+            locale = self.TTS_LOCALE_MAP.get(lang, 'en-US')
+            speech_config.speech_synthesis_language = locale
+            # audio_config=None means we get raw audio bytes back (dubber.py line 223)
+            self._synthesizers[lang] = speechsdk.SpeechSynthesizer(
                 speech_config=speech_config,
                 audio_config=None
             )
 
-            # Synthesize speech
-            result = synthesizer.speak_text(text)
+            self._synth_threads[lang] = {
+                "thread": threading.Thread(
+                    target=self._voice_synth,
+                    args=(lang,),
+                    daemon=True
+                ),
+                "running": True
+            }
+            self._synth_threads[lang]["thread"].start()
+
+    def start(self):
+        """Start continuous recognition - mirrors dubber.py line 763"""
+        self._translation_recognizer.start_continuous_recognition_async().get()
+        print(f"[Session {self.session_id}] Continuous translation started")
+
+    def push_audio(self, audio_bytes: bytes):
+        """Push PCM audio data into the stream for recognition"""
+        self._audio_stream.write(audio_bytes)
+
+    def stop(self):
+        """Stop the session and clean up resources"""
+        print(f"[Session {self.session_id}] Stopping...")
+        self._stop_event.set()
+
+        # Stop synthesis threads
+        for lang, info in self._synth_threads.items():
+            info["running"] = False
+
+        # Stop continuous recognition (dubber.py line 772)
+        if self._translation_recognizer:
+            try:
+                self._translation_recognizer.stop_continuous_recognition_async().get()
+            except Exception as e:
+                print(f"[Session {self.session_id}] Error stopping recognizer: {e}")
+
+        # Close audio stream
+        try:
+            self._audio_stream.close()
+        except Exception:
+            pass
+
+        # Wait for synth threads
+        for lang, info in self._synth_threads.items():
+            if info["thread"].is_alive():
+                info["thread"].join(timeout=2.0)
+
+        print(f"[Session {self.session_id}] Stopped")
+
+    def _on_recognized(self, evt):
+        """
+        Callback when speech is recognized AND translated.
+        This is the key insight from dubber.py (lines 732-746):
+        evt.result.translations already contains all translated text!
+        No separate translation step needed.
+        """
+        if evt.result.reason == speechsdk.ResultReason.TranslatedSpeech:
+            source_text = evt.result.text
+            if not source_text.strip():
+                return
+
+            print(f"[Session {self.session_id}] Recognized: {source_text}")
+
+            # Enqueue translated text for each language (dubber.py lines 741-743)
+            for lang in self.target_languages:
+                trans_code = self.TRANSLATION_LANG_MAP.get(lang, lang)
+                if trans_code in evt.result.translations:
+                    translated = evt.result.translations[trans_code]
+                    print(f"[Session {self.session_id}] -> {lang}: {translated}")
+                    self._translated_text_queues[lang].put(translated)
+
+                    # Immediately broadcast the subtitle text (no need to wait for TTS)
+                    self._broadcast_subtitle(lang, translated)
+
+    def _on_canceled(self, evt):
+        print(f"[Session {self.session_id}] Recognition canceled: {evt.reason}")
+        if evt.reason == speechsdk.CancellationReason.Error:
+            print(f"[Session {self.session_id}] Error details: {evt.error_details}")
+
+    def _on_session_stopped(self, evt):
+        print(f"[Session {self.session_id}] Recognition session stopped")
+
+    def _voice_synth(self, language):
+        """
+        Synthesize translated text to audio - directly from dubber.py lines 866-933.
+        Pulls text from the queue, synthesizes, and broadcasts the audio.
+        """
+        while self._synth_threads[language]["running"]:
+            try:
+                text = self._translated_text_queues[language].get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            # Synthesize speech (dubber.py line 899)
+            result = self._synthesizers[language].speak_text_async(text).get()
 
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                # Encode audio to base64
-                audio_base64 = base64.b64encode(result.audio_data).decode('utf-8')
-                return audio_base64
+                audio_bytes = result.audio_data
+                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                self._broadcast_audio(language, audio_b64)
+                print(f"[Session {self.session_id}] Synthesized {language}: {len(audio_bytes)} bytes")
             else:
-                print(f"Speech synthesis failed: {result.reason}")
-                return None
+                print(f"[Session {self.session_id}] Synthesis failed for {language}: {result.reason}")
+                if result.reason == speechsdk.ResultReason.Canceled:
+                    cancellation = result.cancellation_details
+                    print(f"[Session {self.session_id}] Cancellation reason: {cancellation.reason}")
+                    if cancellation.reason == speechsdk.CancellationReason.Error:
+                        print(f"[Session {self.session_id}] Error: {cancellation.error_details}")
 
-        except Exception as e:
-            print(f"Error in synthesize_speech: {str(e)}")
-            return None
+            self._translated_text_queues[language].task_done()
 
-    def translate_and_synthesize_realtime(
-        self,
-        audio_stream,
-        source_language: str,
-        target_languages: List[str]
-    ):
-        """
-        Real-time translation with continuous recognition
-        For production use with streaming audio
-
-        This method uses Azure Speech Translation for continuous streaming
-        """
+    def _broadcast_subtitle(self, language, text):
+        """Send subtitle text to Node.js backend for broadcasting to listeners"""
         try:
-            # Create translation config
-            translation_config = speechsdk.translation.SpeechTranslationConfig(
-                subscription=self.subscription_key,
-                region=self.region
+            requests.post(
+                f'{self.node_backend_url}/api/broadcast',
+                json={
+                    'sessionId': self.session_id,
+                    'language': language,
+                    'subtitleText': text
+                },
+                timeout=5
             )
-
-            # Set source language
-            translation_config.speech_recognition_language = source_language
-
-            # Add all target languages
-            for target_lang in target_languages:
-                lang_code = self.language_map.get(target_lang, target_lang)
-                translation_config.add_target_language(lang_code)
-
-            # Create audio config from stream
-            audio_config = speechsdk.audio.AudioConfig(stream=audio_stream)
-
-            # Create translation recognizer
-            recognizer = speechsdk.translation.TranslationRecognizer(
-                translation_config=translation_config,
-                audio_config=audio_config
-            )
-
-            # TODO: Setup event handlers for continuous recognition
-            # recognizer.recognized.connect(lambda evt: on_recognized(evt))
-            # recognizer.start_continuous_recognition()
-
-            return recognizer
-
         except Exception as e:
-            print(f"Error in translate_and_synthesize_realtime: {str(e)}")
-            return None
+            print(f"[Session {self.session_id}] Error broadcasting subtitle: {e}")
+
+    def _broadcast_audio(self, language, audio_b64):
+        """Send synthesized audio to Node.js backend for broadcasting to listeners"""
+        try:
+            requests.post(
+                f'{self.node_backend_url}/api/broadcast',
+                json={
+                    'sessionId': self.session_id,
+                    'language': language,
+                    'audioData': audio_b64
+                },
+                timeout=10
+            )
+        except Exception as e:
+            print(f"[Session {self.session_id}] Error broadcasting audio: {e}")

@@ -14,9 +14,6 @@ const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 // Track all WebSocket connections
 const connections = new Map(); // connectionId -> { ws, sessionId, role, language }
 
-/**
- * Setup WebSocket server
- */
 function setupWebSocket(server) {
   const wss = new WebSocket.Server({ server, path: '/ws' });
 
@@ -24,11 +21,10 @@ function setupWebSocket(server) {
     const connectionId = uuidv4();
     console.log(`WebSocket connected: ${connectionId}`);
 
-    // Initialize connection metadata
     connections.set(connectionId, {
       ws,
       sessionId: null,
-      role: null, // 'speaker' or 'listener'
+      role: null,
       language: null
     });
 
@@ -37,7 +33,7 @@ function setupWebSocket(server) {
         const data = JSON.parse(message);
         await handleMessage(connectionId, data);
       } catch (error) {
-        // If not JSON, might be binary audio data
+        // Not JSON = binary audio data from speaker
         handleBinaryMessage(connectionId, message);
       }
     });
@@ -47,59 +43,48 @@ function setupWebSocket(server) {
     });
 
     ws.on('error', (error) => {
-      console.error(`WebSocket error (${connectionId}):`, error);
+      console.error(`WebSocket error (${connectionId}):`, error.message);
       handleDisconnect(connectionId);
     });
   });
 
-  console.log('✓ WebSocket server setup complete');
+  console.log('WebSocket server ready');
 }
 
-/**
- * Handle incoming WebSocket messages
- */
 async function handleMessage(connectionId, data) {
   const conn = connections.get(connectionId);
   if (!conn) return;
 
-  const { type, payload } = data;
-
-  switch (type) {
+  switch (data.type) {
     case 'speaker_join':
-      await handleSpeakerJoin(connectionId, payload);
+      await handleSpeakerJoin(connectionId, data.payload);
       break;
-
     case 'listener_join':
-      await handleListenerJoin(connectionId, payload);
+      await handleListenerJoin(connectionId, data.payload);
       break;
-
     case 'audio_chunk':
-      await handleAudioChunk(connectionId, payload);
+      await handleAudioChunk(connectionId, data.payload);
       break;
-
+    case 'start_speaking':
+      await handleStartSpeaking(connectionId, data.payload);
+      break;
+    case 'stop_speaking':
+      await handleStopSpeaking(connectionId);
+      break;
     case 'speaker_disconnect':
-      handleSpeakerDisconnect(connectionId);
+      await handleSpeakerDisconnect(connectionId);
       break;
-
     default:
-      console.warn(`Unknown message type: ${type}`);
+      console.warn(`Unknown message type: ${data.type}`);
   }
 }
 
-/**
- * Handle binary audio data from speaker
- */
 function handleBinaryMessage(connectionId, buffer) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
-
-  // Forward audio to AI service for processing
   forwardAudioToAI(conn.sessionId, buffer);
 }
 
-/**
- * Handle speaker joining a session
- */
 async function handleSpeakerJoin(connectionId, payload) {
   const { sessionId } = payload;
   const session = await getSession(sessionId);
@@ -115,7 +100,6 @@ async function handleSpeakerJoin(connectionId, payload) {
 
   await setSpeakerConnected(sessionId, true);
 
-  // Notify speaker of successful join
   sendMessage(connectionId, {
     type: 'speaker_joined',
     payload: {
@@ -124,16 +108,11 @@ async function handleSpeakerJoin(connectionId, payload) {
     }
   });
 
-  console.log(`✓ Speaker joined session: ${sessionId}`);
+  console.log(`Speaker joined session: ${sessionId}`);
 }
 
-/**
- * Handle listener joining a session
- */
 async function handleListenerJoin(connectionId, payload) {
   const { sessionId, joinCode, language } = payload;
-
-  // Get session by ID or join code
   const session = await getSession(sessionId || joinCode);
 
   if (!session) {
@@ -153,63 +132,97 @@ async function handleListenerJoin(connectionId, payload) {
 
   await addListener(session.id, connectionId, language);
 
-  // Notify listener of successful join
   sendMessage(connectionId, {
     type: 'listener_joined',
-    payload: {
-      sessionId: session.id,
-      language
-    }
+    payload: { sessionId: session.id, language }
   });
 
-  console.log(`✓ Listener joined session: ${session.id} (${language})`);
+  console.log(`Listener joined session: ${session.id} (${language})`);
 }
 
 /**
- * Handle audio chunk from speaker (JSON-based)
+ * Speaker clicked "Start Speaking" - tell AI service to create a
+ * persistent TranslationSession with continuous recognition.
+ */
+async function handleStartSpeaking(connectionId, payload) {
+  const conn = connections.get(connectionId);
+  if (!conn || conn.role !== 'speaker') return;
+
+  const { sourceLanguage, targetLanguages } = payload;
+
+  try {
+    await axios.post(`${AI_SERVICE_URL}/start-session`, {
+      sessionId: conn.sessionId,
+      sourceLanguage: sourceLanguage || 'en-US',
+      targetLanguages: targetLanguages || ['es', 'fr', 'de']
+    }, { timeout: 10000 });
+
+    console.log(`AI session started for ${conn.sessionId}`);
+
+    sendMessage(connectionId, {
+      type: 'speaking_started',
+      payload: {}
+    });
+  } catch (error) {
+    console.error('Error starting AI session:', error.message);
+    sendError(connectionId, 'Failed to start translation session');
+  }
+}
+
+/**
+ * Speaker clicked "Stop Speaking" - tell AI service to stop.
+ */
+async function handleStopSpeaking(connectionId) {
+  const conn = connections.get(connectionId);
+  if (!conn || conn.role !== 'speaker') return;
+
+  try {
+    await axios.post(`${AI_SERVICE_URL}/end-session`, {
+      sessionId: conn.sessionId
+    }, { timeout: 10000 });
+
+    console.log(`AI session ended for ${conn.sessionId}`);
+  } catch (error) {
+    console.error('Error ending AI session:', error.message);
+  }
+}
+
+/**
+ * Forward audio chunk (JSON base64) to AI service.
  */
 async function handleAudioChunk(connectionId, payload) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
 
-  console.log(`✓ Received audio chunk from speaker (session: ${conn.sessionId})`);
-  
-  // Forward to AI service
   forwardAudioToAI(conn.sessionId, payload.audioData);
 }
 
 /**
- * Forward speaker audio to Python AI service
+ * Forward audio data to the AI service's /process-audio endpoint.
+ * The AI service pushes it into the PushAudioInputStream for
+ * continuous recognition.
  */
 async function forwardAudioToAI(sessionId, audioData) {
   try {
-    // audioData can be either a Buffer (binary) or string (base64)
-    const base64Audio = typeof audioData === 'string' 
-      ? audioData 
+    const base64Audio = typeof audioData === 'string'
+      ? audioData
       : audioData.toString('base64');
 
-    console.log(`→ Forwarding audio to AI service (${base64Audio.length} chars)`);
-
-    // Send audio to AI service for STT + Translation + TTS
     await axios.post(`${AI_SERVICE_URL}/process-audio`, {
       sessionId,
       audioData: base64Audio
-    }, {
-      timeout: 30000 // 30s timeout
-    });
-    
-    console.log(`✓ AI service processed audio successfully`);
+    }, { timeout: 10000 });
   } catch (error) {
-    console.error('Error forwarding audio to AI service:', error.message);
-    if (error.response) {
-      console.error('AI service response:', error.response.status, error.response.data);
+    // Don't spam logs - only log non-404 errors (404 = session not started yet)
+    if (!error.response || error.response.status !== 404) {
+      console.error('Error forwarding audio:', error.message);
     }
   }
 }
 
 /**
- * Broadcast translated audio and subtitles to listeners
- * Called by AI service webhook or polling
+ * Broadcast translated audio and/or subtitles to listeners.
+ * Called by the AI service via POST /api/broadcast.
  */
 async function broadcastToListeners(sessionId, language, audioData, subtitleText) {
   const listenerIds = await getListenersByLanguage(sessionId, language);
@@ -217,43 +230,42 @@ async function broadcastToListeners(sessionId, language, audioData, subtitleText
   listenerIds.forEach(connectionId => {
     const conn = connections.get(connectionId);
     if (conn && conn.ws.readyState === WebSocket.OPEN) {
-      // Send subtitle text
       if (subtitleText) {
         sendMessage(connectionId, {
           type: 'subtitle',
-          payload: {
-            text: subtitleText,
-            language
-          }
+          payload: { text: subtitleText, language }
         });
       }
-
-      // Send audio chunk
       if (audioData) {
         sendMessage(connectionId, {
           type: 'audio',
-          payload: {
-            audioData,
-            language
-          }
+          payload: { audioData, language }
         });
       }
     }
   });
 
-  console.log(`✓ Broadcast to ${listenerIds.length} listeners (${language})`);
+  if (listenerIds.length > 0) {
+    console.log(`Broadcast to ${listenerIds.length} listeners (${language})`);
+  }
 }
 
-/**
- * Handle speaker disconnect
- */
 async function handleSpeakerDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
 
+  // Stop AI session
+  try {
+    await axios.post(`${AI_SERVICE_URL}/end-session`, {
+      sessionId: conn.sessionId
+    }, { timeout: 5000 });
+  } catch (error) {
+    // ignore
+  }
+
   await setSpeakerConnected(conn.sessionId, false);
 
-  // Notify all listeners that speaker disconnected
+  // Notify listeners
   const session = await getSession(conn.sessionId);
   if (session && session.listeners) {
     for (const [language, listeners] of Object.entries(session.listeners)) {
@@ -266,12 +278,9 @@ async function handleSpeakerDisconnect(connectionId) {
     }
   }
 
-  console.log(`✓ Speaker disconnected from session: ${conn.sessionId}`);
+  console.log(`Speaker disconnected from session: ${conn.sessionId}`);
 }
 
-/**
- * Handle connection disconnect
- */
 async function handleDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
@@ -283,12 +292,8 @@ async function handleDisconnect(connectionId) {
   }
 
   connections.delete(connectionId);
-  console.log(`✓ Connection closed: ${connectionId}`);
 }
 
-/**
- * Send message to a specific connection
- */
 function sendMessage(connectionId, message) {
   const conn = connections.get(connectionId);
   if (conn && conn.ws.readyState === WebSocket.OPEN) {
@@ -296,9 +301,6 @@ function sendMessage(connectionId, message) {
   }
 }
 
-/**
- * Send error message
- */
 function sendError(connectionId, errorMessage) {
   sendMessage(connectionId, {
     type: 'error',

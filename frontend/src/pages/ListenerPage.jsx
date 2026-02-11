@@ -23,21 +23,33 @@ function ListenerPage() {
   const [selectedLanguage, setSelectedLanguage] = useState('en')
   const [isJoined, setIsJoined] = useState(false)
   const [currentSubtitle, setCurrentSubtitle] = useState('')
+  const [subtitleHistory, setSubtitleHistory] = useState([])
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
 
   const wsRef = useRef(null)
   const audioContextRef = useRef(null)
+  // Queue audio playback so chunks don't overlap
   const audioQueueRef = useRef([])
+  const isPlayingRef = useRef(false)
 
   useEffect(() => {
-    // Initialize audio context
-    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
-
-    return () => {
-      cleanup()
-    }
+    return () => cleanup()
   }, [])
+
+  /**
+   * Initialize AudioContext on user gesture (required by browsers).
+   * Called when joining a session.
+   */
+  const initAudioContext = () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+    }
+    // Resume if suspended (browser autoplay policy)
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume()
+    }
+  }
 
   const handleJoin = async () => {
     if (!joinCode.trim()) {
@@ -48,7 +60,6 @@ function ListenerPage() {
     setError('')
     setStatus('Connecting...')
 
-    // Verify session exists
     try {
       const response = await fetch(`${config.apiUrl}/api/sessions/${joinCode}`)
       const data = await response.json()
@@ -59,9 +70,10 @@ function ListenerPage() {
         return
       }
 
-      // Setup WebSocket and join session
-      setupWebSocket(data.session.id)
+      // Init audio context on this user gesture (click)
+      initAudioContext()
 
+      setupWebSocket(data.session.id)
     } catch (err) {
       console.error('Error joining session:', err)
       setError('Failed to join session')
@@ -71,14 +83,9 @@ function ListenerPage() {
 
   const setupWebSocket = (sessionId) => {
     const wsUrl = config.getWebSocketUrl()
-    console.log('Connecting to WebSocket:', wsUrl)
-
     wsRef.current = new WebSocket(wsUrl)
 
     wsRef.current.onopen = () => {
-      console.log('WebSocket connected')
-
-      // Send listener join message
       wsRef.current.send(JSON.stringify({
         type: 'listener_join',
         payload: {
@@ -94,17 +101,13 @@ function ListenerPage() {
       handleWebSocketMessage(message)
     }
 
-    wsRef.current.onerror = (error) => {
-      console.error('WebSocket error:', error)
+    wsRef.current.onerror = () => {
       setError('Connection error')
       setStatus('')
     }
 
     wsRef.current.onclose = () => {
-      console.log('WebSocket closed')
-      if (isJoined) {
-        setStatus('Disconnected from session')
-      }
+      if (isJoined) setStatus('Disconnected from session')
     }
   }
 
@@ -119,15 +122,12 @@ function ListenerPage() {
         break
 
       case 'audio':
-        playAudio(payload.audioData)
+        queueAudio(payload.audioData)
         break
 
       case 'subtitle':
         setCurrentSubtitle(payload.text)
-        // Clear subtitle after 5 seconds
-        setTimeout(() => {
-          setCurrentSubtitle(prev => prev === payload.text ? '' : prev)
-        }, 5000)
+        setSubtitleHistory(prev => [...prev.slice(-4), payload.text])
         break
 
       case 'speaker_disconnected':
@@ -138,32 +138,56 @@ function ListenerPage() {
         setError(payload.message)
         setStatus('')
         break
-
-      default:
-        console.log('Unknown message type:', type)
     }
   }
 
-  const playAudio = async (audioDataBase64) => {
+  /**
+   * Queue audio for sequential playback.
+   * The AI service sends WAV audio (RIFF header + PCM data) as base64.
+   * AudioContext.decodeAudioData handles WAV natively.
+   */
+  const queueAudio = (audioDataBase64) => {
+    audioQueueRef.current.push(audioDataBase64)
+    if (!isPlayingRef.current) {
+      playNextInQueue()
+    }
+  }
+
+  const playNextInQueue = async () => {
+    if (audioQueueRef.current.length === 0) {
+      isPlayingRef.current = false
+      return
+    }
+
+    isPlayingRef.current = true
+    const audioDataBase64 = audioQueueRef.current.shift()
+
     try {
-      // Decode base64 audio
+      const ctx = audioContextRef.current
+      if (!ctx) return
+
+      // Resume if suspended
+      if (ctx.state === 'suspended') await ctx.resume()
+
+      // Decode base64 to ArrayBuffer
       const binaryString = atob(audioDataBase64)
       const bytes = new Uint8Array(binaryString.length)
       for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i)
       }
 
-      // Decode audio data
-      const audioBuffer = await audioContextRef.current.decodeAudioData(bytes.buffer)
+      // decodeAudioData handles WAV (RIFF) format natively
+      const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
 
-      // Create audio source
-      const source = audioContextRef.current.createBufferSource()
+      const source = ctx.createBufferSource()
       source.buffer = audioBuffer
-      source.connect(audioContextRef.current.destination)
+      source.connect(ctx.destination)
+      source.onended = () => playNextInQueue()
       source.start(0)
-
     } catch (err) {
       console.error('Error playing audio:', err)
+      // Skip this chunk and try the next one
+      playNextInQueue()
     }
   }
 
@@ -172,9 +196,12 @@ function ListenerPage() {
     setIsJoined(false)
     setStatus('')
     setCurrentSubtitle('')
+    setSubtitleHistory([])
   }
 
   const cleanup = () => {
+    audioQueueRef.current = []
+    isPlayingRef.current = false
     if (wsRef.current) {
       wsRef.current.close()
       wsRef.current = null
@@ -191,9 +218,7 @@ function ListenerPage() {
           </div>
 
           {status && (
-            <div className="status status-success">
-              {status}
-            </div>
+            <div className="status status-success">{status}</div>
           )}
 
           {error && (
@@ -201,7 +226,14 @@ function ListenerPage() {
           )}
 
           <div className="subtitle-box">
-            <div className="subtitle-text">
+            {subtitleHistory.length > 1 && (
+              <div style={{ opacity: 0.5, fontSize: '0.9rem', marginBottom: '8px' }}>
+                {subtitleHistory.slice(0, -1).map((text, i) => (
+                  <div key={i} className="subtitle-text">{text}</div>
+                ))}
+              </div>
+            )}
+            <div className="subtitle-text" style={{ fontSize: '1.3rem' }}>
               {currentSubtitle || 'Waiting for translation...'}
             </div>
           </div>
@@ -226,13 +258,8 @@ function ListenerPage() {
           <p>Enter the session code to start listening</p>
         </div>
 
-        {error && (
-          <div className="error-message">{error}</div>
-        )}
-
-        {status && (
-          <div className="status status-warning">{status}</div>
-        )}
+        {error && <div className="error-message">{error}</div>}
+        {status && <div className="status status-warning">{status}</div>}
 
         <div style={{ marginTop: '30px' }}>
           <label style={{ display: 'block', marginBottom: '8px', fontWeight: '500' }}>
