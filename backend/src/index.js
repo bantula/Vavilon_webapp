@@ -21,7 +21,15 @@ const app = express();
 const server = http.createServer(app);
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'https://green-pond-05766a403.1.azurestaticapps.net',
+    'https://vavilonapp.rs',
+    'https://www.vavilonapp.rs'
+  ],
+  credentials: true
+}));
 app.use(express.json());
 
 // Routes

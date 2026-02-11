@@ -50,7 +50,7 @@ function ListenerPage() {
 
     // Verify session exists
     try {
-      const response = await fetch(`/api/sessions/${joinCode}`)
+      const response = await fetch(`${config.apiUrl}/api/sessions/${joinCode}`)
       const data = await response.json()
 
       if (!data.success) {

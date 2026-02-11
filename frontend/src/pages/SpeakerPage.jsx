@@ -37,7 +37,7 @@ function SpeakerPage() {
 
   const fetchSessionDetails = async () => {
     try {
-      const response = await fetch(`/api/sessions/${sessionId}`)
+      const response = await fetch(`${config.apiUrl}/api/sessions/${sessionId}`)
       const data = await response.json()
 
       if (data.success) {
@@ -53,7 +53,7 @@ function SpeakerPage() {
 
   const fetchStats = async () => {
     try {
-      const response = await fetch(`/api/sessions/${sessionId}/stats`)
+      const response = await fetch(`${config.apiUrl}/api/sessions/${sessionId}/stats`)
       const data = await response.json()
 
       if (data.success) {
@@ -167,7 +167,7 @@ function SpeakerPage() {
     stopRecording()
 
     try {
-      await fetch(`/api/sessions/${sessionId}`, {
+      await fetch(`${config.apiUrl}/api/sessions/${sessionId}`, {
         method: 'DELETE'
       })
 

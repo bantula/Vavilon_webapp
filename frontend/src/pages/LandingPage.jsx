@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import config from '../config'
 
 function LandingPage() {
   const navigate = useNavigate()
@@ -11,7 +12,7 @@ function LandingPage() {
     setError('')
 
     try {
-      const response = await fetch('/api/sessions', {
+      const response = await fetch(`${config.apiUrl}/api/sessions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
