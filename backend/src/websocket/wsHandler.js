@@ -172,6 +172,8 @@ async function handleAudioChunk(connectionId, payload) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
 
+  console.log(`✓ Received audio chunk from speaker (session: ${conn.sessionId})`);
+  
   // Forward to AI service
   forwardAudioToAI(conn.sessionId, payload.audioData);
 }
@@ -181,15 +183,27 @@ async function handleAudioChunk(connectionId, payload) {
  */
 async function forwardAudioToAI(sessionId, audioData) {
   try {
+    // audioData can be either a Buffer (binary) or string (base64)
+    const base64Audio = typeof audioData === 'string' 
+      ? audioData 
+      : audioData.toString('base64');
+
+    console.log(`→ Forwarding audio to AI service (${base64Audio.length} chars)`);
+
     // Send audio to AI service for STT + Translation + TTS
     await axios.post(`${AI_SERVICE_URL}/process-audio`, {
       sessionId,
-      audioData: audioData.toString('base64')
+      audioData: base64Audio
     }, {
       timeout: 30000 // 30s timeout
     });
+    
+    console.log(`✓ AI service processed audio successfully`);
   } catch (error) {
     console.error('Error forwarding audio to AI service:', error.message);
+    if (error.response) {
+      console.error('AI service response:', error.response.status, error.response.data);
+    }
   }
 }
 
