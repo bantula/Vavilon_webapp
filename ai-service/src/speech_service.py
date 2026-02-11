@@ -116,6 +116,13 @@ class TranslationSession:
             )
             locale = self.TTS_LOCALE_MAP.get(lang, 'en-US')
             speech_config.speech_synthesis_language = locale
+            
+            # Set output format to WAV (RIFF) 24kHz 16-bit mono PCM
+            # This ensures browser's AudioContext.decodeAudioData() can decode it
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
+            )
+            
             # audio_config=None means we get raw audio bytes back (dubber.py line 223)
             self._synthesizers[lang] = speechsdk.SpeechSynthesizer(
                 speech_config=speech_config,
@@ -219,9 +226,11 @@ class TranslationSession:
 
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                 audio_bytes = result.audio_data
+                print(f"[Session {self.session_id}] Synthesized {language}: {len(audio_bytes)} bytes for text: '{text[:50]}...'")
                 audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                print(f"[Session {self.session_id}] Base64 audio length: {len(audio_b64)} chars")
                 self._broadcast_audio(language, audio_b64)
-                print(f"[Session {self.session_id}] Synthesized {language}: {len(audio_bytes)} bytes")
+                print(f"[Session {self.session_id}] Audio broadcast sent for {language}")
             else:
                 print(f"[Session {self.session_id}] Synthesis failed for {language}: {result.reason}")
                 if result.reason == speechsdk.ResultReason.Canceled:
@@ -250,7 +259,7 @@ class TranslationSession:
     def _broadcast_audio(self, language, audio_b64):
         """Send synthesized audio to Node.js backend for broadcasting to listeners"""
         try:
-            requests.post(
+            response = requests.post(
                 f'{self.node_backend_url}/api/broadcast',
                 json={
                     'sessionId': self.session_id,
@@ -259,5 +268,6 @@ class TranslationSession:
                 },
                 timeout=10
             )
+            print(f"[Session {self.session_id}] Broadcast audio response: {response.status_code}")
         except Exception as e:
             print(f"[Session {self.session_id}] Error broadcasting audio: {e}")

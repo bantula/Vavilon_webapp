@@ -1,0 +1,245 @@
+# Vavilon — Copilot Context File
+
+Use this file to get up to speed when starting a fresh chat. It covers architecture, current state, data flow, key files, and known issues.
+
+---
+
+## What is Vavilon?
+
+Real-time spoken translation web app for tours/museums/conferences. **One speaker → many listeners** broadcast system. Speaker talks into their phone, listeners each hear translated speech + subtitles in their chosen language. Web-only, no app install.
+
+Target: up to 200 concurrent listeners, 10 languages, demo-ready MVP.
+
+---
+
+## Architecture (3 services)
+
+```
+┌─────────────┐   WebSocket    ┌──────────────────┐   HTTP (REST)   ┌─────────────────────┐
+│   Frontend   │ ──────────── > │  Node.js Backend │ ──────────── > │  Python AI Service  │
+│  (React/Vite)│ < ──────────── │  (Express + WS)  │ < ──────────── │  (Flask + Azure SDK) │
+│  port 5173   │                │    port 3000     │                │     port 5000        │
+└─────────────┘                └──────────────────┘                └─────────────────────┘
+                                      │
+                                      ▼
+                                   Redis
+                              (session storage)
+```
+
+### Azure Deployment
+
+| Service | Azure Resource | Region |
+|---------|---------------|--------|
+| Backend | App Service (`vavilon-backend`) | westeurope |
+| AI Service | Container Instance (`vavilon-ai`) | westeurope |
+| Frontend | Static Web Apps (GitHub-linked) | auto |
+| Sessions | Azure Cache for Redis | westeurope |
+| Speech | Azure Cognitive Services Speech | westeurope |
+| Domain | vavilonapp.rs (custom) | — |
+
+Resource group: `vavilon-rg`
+
+---
+
+## Data Flow (audio pipeline)
+
+```
+1. Speaker's browser captures raw PCM audio (16kHz, 16-bit, mono)
+   - AudioContext + ScriptProcessorNode → Float32 → downsample to Int16 @ 16kHz
+   - Base64-encode and send over WebSocket as JSON { type: "audio_chunk", payload: { audioData } }
+
+2. Node.js backend receives audio_chunk, forwards to AI service
+   - HTTP POST to AI_SERVICE_URL/process-audio with { sessionId, audioData (base64) }
+
+3. Python AI service pushes PCM bytes into PushAudioInputStream
+   - Azure TranslationRecognizer does continuous STT + translation in one step
+   - On recognition: translated text is queued per target language
+
+4. Per-language SpeechSynthesizer threads synthesize TTS audio
+   - Subtitles broadcast immediately via POST to Node backend /api/broadcast
+   - Synthesized WAV audio broadcast via POST to Node backend /api/broadcast
+
+5. Node.js backend broadcasts to listeners over WebSocket
+   - { type: "subtitle", payload: { text, language } }
+   - { type: "audio", payload: { audioData (base64 WAV), language } }
+
+6. Listener's browser decodes WAV with AudioContext.decodeAudioData and plays sequentially
+```
+
+---
+
+## Key Files
+
+### Backend (Node.js)
+| File | Purpose |
+|------|---------|
+| `backend/src/index.js` | Express server, CORS, health check, App Insights |
+| `backend/src/websocket/wsHandler.js` | WebSocket handler — speaker/listener connections, audio relay |
+| `backend/src/routes/sessions.js` | REST API for session CRUD |
+| `backend/src/routes/broadcast.js` | POST /api/broadcast — receives translations from AI, sends to listeners |
+| `backend/src/services/sessionService.js` | Redis-backed session management, join codes, listener tracking |
+
+### AI Service (Python)
+| File | Purpose |
+|------|---------|
+| `ai-service/src/app.py` | Flask server with `/start-session`, `/process-audio`, `/end-session` |
+| `ai-service/src/speech_service.py` | `TranslationSession` class — Azure SDK continuous recognition + TTS |
+| `ai-service/Dockerfile` | Python 3.9 slim container (NOTE: still installs ffmpeg, no longer needed) |
+| `ai-service/requirements.txt` | flask, flask-cors, azure-cognitiveservices-speech, requests, python-dotenv |
+
+### Frontend (React + Vite)
+| File | Purpose |
+|------|---------|
+| `frontend/src/pages/SpeakerPage.jsx` | Mic capture (raw PCM), source language selector, WebSocket streaming |
+| `frontend/src/pages/ListenerPage.jsx` | Join by code, language select, audio queue playback, subtitle display |
+| `frontend/src/pages/LandingPage.jsx` | Home page — create session or join |
+| `frontend/src/config.js` | API URL + WebSocket URL helper (uses VITE_BACKEND_URL) |
+
+### Other
+| File | Purpose |
+|------|---------|
+| `DEPLOYMENT.md` | Full Azure deployment guide (all steps) |
+| `dubber.py` | Reference file from hardware version — NOT used at runtime, safe to delete |
+
+---
+
+## WebSocket Message Types
+
+### Speaker → Backend
+| Type | Payload | When |
+|------|---------|------|
+| `speaker_join` | `{ sessionId }` | On connect |
+| `start_speaking` | `{ sourceLanguage, targetLanguages }` | Click "Start Speaking" |
+| `audio_chunk` | `{ audioData }` (base64 Int16 PCM) | Continuously while recording |
+| `stop_speaking` | `{}` | Click "Stop Speaking" |
+| `speaker_disconnect` | `{}` | On page close |
+
+### Backend → AI Service (HTTP)
+| Endpoint | Body | When |
+|----------|------|------|
+| `POST /start-session` | `{ sessionId, sourceLanguage, targetLanguages }` | Speaker starts |
+| `POST /process-audio` | `{ sessionId, audioData }` (base64) | Each audio chunk |
+| `POST /end-session` | `{ sessionId }` | Speaker stops |
+
+### AI Service → Backend (HTTP)
+| Endpoint | Body | When |
+|----------|------|------|
+| `POST /api/broadcast` | `{ sessionId, language, subtitleText }` | On each recognition |
+| `POST /api/broadcast` | `{ sessionId, language, audioData }` (base64 WAV) | After TTS synthesis |
+
+### Backend → Listener
+| Type | Payload | When |
+|------|---------|------|
+| `listener_joined` | `{ sessionId, language }` | Confirmation |
+| `subtitle` | `{ text, language }` | Each translated sentence |
+| `audio` | `{ audioData, language }` (base64 WAV) | Each synthesized audio |
+| `speaker_disconnected` | `{}` | Speaker leaves |
+
+---
+
+## Environment Variables
+
+### Backend (.env)
+```
+PORT=3000
+AI_SERVICE_URL=http://localhost:5000        # or https://vavilon-ai.westeurope.azurecontainer.io:5000
+FRONTEND_URL=http://localhost:5173
+REDIS_URL=rediss://<name>.redis.cache.windows.net:6380
+REDIS_PASSWORD=<key>
+APPINSIGHTS_INSTRUMENTATIONKEY=<optional>
+```
+
+### AI Service (.env)
+```
+PORT=5000
+AZURE_SPEECH_KEY=<key>
+AZURE_SPEECH_REGION=westeurope
+NODE_BACKEND_URL=http://localhost:3000      # or https://vavilon-backend.azurewebsites.net
+```
+
+### Frontend (.env)
+```
+VITE_BACKEND_URL=http://localhost:3000      # or https://vavilon-backend.azurewebsites.net
+```
+
+---
+
+## Azure Speech SDK Patterns (critical)
+
+The AI service uses `azure-cognitiveservices-speech` with this pattern:
+
+1. **PushAudioInputStream** — browser audio is pushed in as raw PCM (16kHz/16-bit/mono)
+2. **SpeechTranslationConfig** — combined STT + translation in one recognizer
+3. **TranslationRecognizer.start_continuous_recognition_async()** — persistent, not per-chunk
+4. **recognized callback** — `evt.result.translations[lang_code]` gives translated text
+5. **Per-language SpeechSynthesizer** — `audio_config=None` returns WAV bytes in `result.audio_data`
+6. **Threading** — one synthesis thread per target language, pulls from a queue
+
+Language maps in `speech_service.py`:
+```python
+TRANSLATION_LANG_MAP = {
+    'en': 'en', 'es': 'es', 'fr': 'fr', 'de': 'de', 'it': 'it',
+    'pt': 'pt', 'ru': 'ru', 'zh': 'zh-Hans', 'ja': 'ja', 'ar': 'ar'
+}
+TTS_LOCALE_MAP = {
+    'en': 'en-US', 'es': 'es-ES', 'fr': 'fr-FR', 'de': 'de-DE',
+    'it': 'it-IT', 'pt': 'pt-PT', 'ru': 'ru-RU', 'zh': 'zh-CN',
+    'ja': 'ja-JP', 'ar': 'ar-SA'
+}
+```
+
+---
+
+## Browser Audio Capture (critical)
+
+The speaker page uses **AudioContext + ScriptProcessorNode** (NOT MediaRecorder):
+- MediaRecorder outputs WebM/Opus — Azure SDK cannot read this
+- AudioContext gives raw Float32 PCM at the browser's native rate (44100 or 48000 Hz)
+- `downsampleToInt16()` converts Float32 → Int16 and resamples to 16kHz
+- Result is base64-encoded and sent as JSON over WebSocket
+
+---
+
+## CORS Configuration
+
+Backend allows these origins (in `backend/src/index.js`):
+```
+http://localhost:5173
+https://green-pond-05766a403.1.azurestaticapps.net
+https://vavilonapp.rs
+https://www.vavilonapp.rs
+```
+
+---
+
+## Known Issues / TODOs
+
+1. **Dockerfile still installs ffmpeg** — no longer needed since pydub was removed. Can remove the `apt-get install -y ffmpeg` line.
+2. **ScriptProcessorNode is deprecated** — works fine but browsers recommend AudioWorklet. Low priority.
+3. **No authentication** — intentional for MVP. Sessions are public with a 6-char join code.
+4. **In-memory AI sessions** — if the AI container restarts, active translation sessions are lost.
+5. **After rewriting the audio pipeline, all 3 services need redeployment** to test end-to-end.
+
+---
+
+## Deployment Cheat Sheet
+
+### Backend (Step 3.3)
+```powershell
+# Create zip with Python (NOT PowerShell Compress-Archive — it uses backslash paths that break Linux)
+cd backend
+python -c "import zipfile, os; zf=zipfile.ZipFile('deploy.zip','w',zipfile.ZIP_DEFLATED); [zf.write(os.path.join(r,f), os.path.join(r,f).replace(os.sep,'/')) for r,d,fs in os.walk('src') for f in fs]; [zf.write(x) for x in ['package.json','package-lock.json']]; zf.close()"
+
+# Deploy (use config-zip, NOT "az webapp deploy --type zip")
+az webapp deployment source config-zip --resource-group vavilon-rg --name vavilon-backend --src deploy.zip
+```
+
+### AI Service (Step 2)
+```powershell
+cd ai-service
+az acr build --registry vavilonacr --image vavilon-ai:latest .
+# Then update/recreate the container instance
+```
+
+### Frontend
+Auto-deploys via GitHub Actions when pushed to main (Static Web Apps).

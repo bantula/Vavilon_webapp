@@ -227,6 +227,14 @@ async function forwardAudioToAI(sessionId, audioData) {
 async function broadcastToListeners(sessionId, language, audioData, subtitleText) {
   const listenerIds = await getListenersByLanguage(sessionId, language);
 
+  console.log(`Broadcasting to ${listenerIds.length} listeners for ${language} in session ${sessionId}`);
+  if (audioData) {
+    console.log(`  Audio data length: ${audioData.length} chars`);
+  }
+  if (subtitleText) {
+    console.log(`  Subtitle: "${subtitleText}"`);
+  }
+
   listenerIds.forEach(connectionId => {
     const conn = connections.get(connectionId);
     if (conn && conn.ws.readyState === WebSocket.OPEN) {
@@ -237,11 +245,14 @@ async function broadcastToListeners(sessionId, language, audioData, subtitleText
         });
       }
       if (audioData) {
+        console.log(`  Sending audio to connection ${connectionId}`);
         sendMessage(connectionId, {
           type: 'audio',
           payload: { audioData, language }
         });
       }
+    } else {
+      console.log(`  Connection ${connectionId} is not open (state: ${conn?.ws.readyState})`);
     }
   });
 

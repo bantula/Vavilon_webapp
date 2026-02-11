@@ -147,8 +147,10 @@ function ListenerPage() {
    * AudioContext.decodeAudioData handles WAV natively.
    */
   const queueAudio = (audioDataBase64) => {
+    console.log(`Queueing audio: ${audioDataBase64.length} chars, queue size: ${audioQueueRef.current.length}`)
     audioQueueRef.current.push(audioDataBase64)
     if (!isPlayingRef.current) {
+      console.log('Starting audio playback')
       playNextInQueue()
     }
   }
@@ -164,10 +166,16 @@ function ListenerPage() {
 
     try {
       const ctx = audioContextRef.current
-      if (!ctx) return
+      if (!ctx) {
+        console.error('AudioContext not initialized')
+        playNextInQueue()
+        return
+      }
 
       // Resume if suspended
       if (ctx.state === 'suspended') await ctx.resume()
+
+      console.log(`Decoding audio: ${audioDataBase64.length} chars`)
 
       // Decode base64 to ArrayBuffer
       const binaryString = atob(audioDataBase64)
@@ -176,13 +184,20 @@ function ListenerPage() {
         bytes[i] = binaryString.charCodeAt(i)
       }
 
+      console.log(`Audio bytes decoded: ${bytes.length} bytes`)
+
       // decodeAudioData handles WAV (RIFF) format natively
       const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
+
+      console.log(`Audio decoded: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz`)
 
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
       source.connect(ctx.destination)
-      source.onended = () => playNextInQueue()
+      source.onended = () => {
+        console.log('Audio playback finished')
+        playNextInQueue()
+      }
       source.start(0)
     } catch (err) {
       console.error('Error playing audio:', err)
