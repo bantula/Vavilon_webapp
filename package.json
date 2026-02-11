@@ -5,13 +5,11 @@
   "private": true,
   "workspaces": [
     "backend",
-    "ai-service",
     "frontend"
   ],
   "scripts": {
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:ai\" \"npm run dev:frontend\"",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "cd backend && npm run dev",
-    "dev:ai": "cd ai-service && npm run dev",
     "dev:frontend": "cd frontend && npm run dev"
   },
   "devDependencies": {

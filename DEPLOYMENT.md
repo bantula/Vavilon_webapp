@@ -160,6 +160,7 @@ Register the required Azure resource providers (this can take a few minutes):
 # Register providers required for this deployment
 az provider register --namespace Microsoft.Cache
 az provider register --namespace Microsoft.CognitiveServices
+az provider register --namespace Microsoft.ContainerRegistry
 az provider register --namespace Microsoft.Web
 az provider register --namespace Microsoft.ContainerInstance
 az provider register --namespace Microsoft.App
@@ -167,6 +168,7 @@ az provider register --namespace Microsoft.App
 # Check registration status (look for "RegistrationState: Registered")
 az provider show --namespace Microsoft.Cache --query "registrationState"
 az provider show --namespace Microsoft.CognitiveServices --query "registrationState"
+az provider show --namespace Microsoft.ContainerRegistry --query "registrationState"
 ```
 
 **If you see "Registering"**, wait 5-10 minutes and check again. You cannot proceed until all show `"Registered"`.
@@ -243,6 +245,13 @@ docker build -t vavilon-ai:latest .
 # Tag for Azure Container Registry
 docker tag vavilon-ai:latest vavilonacr.azurecr.io/vavilon-ai:latest
 
+# Create ACR (if it does not exist yet)
+az acr create \
+  --name vavilonacr \
+  --resource-group vavilon-rg \
+  --sku Basic \
+  --location westeurope
+
 # Login to ACR
 az acr login --name vavilonacr
 
@@ -253,10 +262,21 @@ docker push vavilonacr.azurecr.io/vavilon-ai:latest
 ### 2.3 Deploy to Container Instance
 
 ```bash
+# If ACR is private, provide registry credentials
+# (Enable admin and fetch credentials once)
+az acr update --name vavilonacr --admin-enabled true
+az acr credential show --name vavilonacr
+
 az container create \
   --name vavilon-ai \
   --resource-group vavilon-rg \
   --image vavilonacr.azurecr.io/vavilon-ai:latest \
+  --registry-login-server vavilonacr.azurecr.io \
+  --registry-username vavilonacr \
+  --registry-password <ACR_PASSWORD> \
+  --os-type Linux \
+  --cpu 1 \
+  --memory 1.5 \
   --dns-name-label vavilon-ai \
   --ports 5000 \
   --environment-variables \
@@ -271,11 +291,19 @@ az container create \
 ### 3.1 Create App Service
 
 ```bash
+# Create App Service plan
+az appservice plan create \
+  --name vavilon-plan \
+  --resource-group vavilon-rg \
+  --location westeurope \
+  --sku B1 \
+  --is-linux
+
 az webapp create \
   --name vavilon-backend \
   --resource-group vavilon-rg \
   --plan vavilon-plan \
-  --runtime "NODE|18-lts"
+  --runtime "NODE|20-lts"
 ```
 
 ### 3.2 Configure Environment
@@ -286,26 +314,68 @@ az webapp config appsettings set \
   --resource-group vavilon-rg \
   --settings \
     PORT=8080 \
-    AI_SERVICE_URL=https://vavilon-ai.eastus.azurecontainer.io:5000 \
+    AI_SERVICE_URL=https://vavilon-ai.westeurope.azurecontainer.io:5000 \
     FRONTEND_URL=https://vavilon-app.azurestaticapps.net \
-    REDIS_URL=<your-redis-connection-string>
+    REDIS_URL=vavilon-redis.redis.cache.windows.net \
+    SCM_DO_BUILD_DURING_DEPLOYMENT=true
+
+# Set explicit startup command
+az webapp config set \
+  --name vavilon-backend \
+  --resource-group vavilon-rg \
+  --startup-file "node src/index.js"
 ```
+
+**Important:** `SCM_DO_BUILD_DURING_DEPLOYMENT=true` tells Azure's Oryx build system to run
+`npm install` after extracting the zip. Without this, your zip has no `node_modules` and the
+deployment will fail with a 400 error.
 
 ### 3.3 Deploy Code
 
-```bash
+```powershell
 cd backend
 
-# Build
-npm install --production
+# If using a monorepo workspace setup, generate backend-specific package-lock.json
+# (Skip this if package-lock.json already exists in backend folder)
+npm install --no-workspaces
 
-# Deploy via ZIP
-zip -r deploy.zip .
-az webapp deployment source config-zip \
-  --name vavilon-backend \
-  --resource-group vavilon-rg \
-  --src deploy.zip
+# IMPORTANT: Do NOT use PowerShell's Compress-Archive for zips targeting Linux.
+# It stores paths with Windows backslashes (src\index.js) which causes rsync failures
+# on Azure's Linux containers. Use Python instead to create Linux-compatible zips:
+python -c @"
+import zipfile, os
+if os.path.exists('deploy.zip'): os.remove('deploy.zip')
+with zipfile.ZipFile('deploy.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
+    zf.write('package.json', 'package.json')
+    zf.write('package-lock.json', 'package-lock.json')
+    for root, dirs, files in os.walk('src'):
+        for f in files:
+            fp = os.path.join(root, f)
+            zf.write(fp, fp.replace(os.sep, '/'))
+"@
+
+# Deploy using zipdeploy (triggers Oryx build with SCM_DO_BUILD_DURING_DEPLOYMENT=true)
+az webapp deployment source config-zip `
+  --name vavilon-backend `
+  --resource-group vavilon-rg `
+  --src .\deploy.zip
+
+# Monitor build and deployment progress (wait 2-3 minutes for npm install)
+az webapp log tail --name vavilon-backend --resource-group vavilon-rg
 ```
+
+**Important notes:**
+- **Do NOT use `Compress-Archive`** (PowerShell) to create the zip. It stores Windows-style
+  backslash paths (`src\index.js`). Azure Linux containers use rsync to copy files, and rsync
+  treats backslashes as literal characters, causing `Invalid argument (22)` errors and build failure.
+  Python's `zipfile` module normalizes paths to forward slashes.
+- Uses `az webapp deployment source config-zip` (NOT `az webapp deploy --type zip`).
+  The older zipdeploy endpoint (`/api/zipdeploy`) works reliably with Oryx builds.
+  The newer publish endpoint (`/api/publish` used by `az webapp deploy`) does stricter
+  validation and often returns 400 for zips without `node_modules`.
+- Small zip file (~24KB instead of 94MB with node_modules)
+- Azure runs `npm install --production` after extracting (because of `SCM_DO_BUILD_DURING_DEPLOYMENT`)
+- `--no-workspaces` flag ensures standalone package-lock.json in monorepo setups
 
 ### 3.4 Enable WebSockets
 
