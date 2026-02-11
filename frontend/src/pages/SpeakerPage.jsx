@@ -118,10 +118,23 @@ function SpeakerPage() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       audioStreamRef.current = stream
 
+      // Try to use WAV format if supported, otherwise fall back to WebM
+      let options = { mimeType: 'audio/wav' }
+      
+      if (!MediaRecorder.isTypeSupported('audio/wav')) {
+        if (MediaRecorder.isTypeSupported('audio/webm')) {
+          options = { mimeType: 'audio/webm' }
+        } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+          options = { mimeType: 'audio/ogg' }
+        } else {
+          options = {}
+        }
+      }
+
+      console.log('Using audio format:', options.mimeType || 'default')
+
       // Create MediaRecorder
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm'
-      })
+      const mediaRecorder = new MediaRecorder(stream, options)
       mediaRecorderRef.current = mediaRecorder
 
       // Handle audio data

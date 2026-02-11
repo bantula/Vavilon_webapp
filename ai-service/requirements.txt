@@ -3,3 +3,4 @@ flask-cors==4.0.0
 azure-cognitiveservices-speech==1.36.0
 requests==2.31.0
 python-dotenv==1.0.1
+pydub==0.25.1

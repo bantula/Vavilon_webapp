@@ -2,6 +2,8 @@ import azure.cognitiveservices.speech as speechsdk
 import io
 import base64
 from typing import Dict, List
+from pydub import AudioSegment
+import wave
 
 
 class SpeechTranslationService:
@@ -27,6 +29,32 @@ class SpeechTranslationService:
             'ja': 'ja-JP',
             'ar': 'ar-SA'
         }
+
+    def convert_to_wav(self, audio_bytes: bytes) -> bytes:
+        """
+        Convert any audio format (WebM, MP3, etc.) to WAV format required by Azure Speech SDK
+        Format: 16kHz, mono, 16-bit PCM
+        """
+        try:
+            # Load audio from bytes
+            audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+            
+            # Convert to required format: 16kHz, mono, 16-bit
+            audio = audio.set_frame_rate(16000)
+            audio = audio.set_channels(1)
+            audio = audio.set_sample_width(2)  # 2 bytes = 16-bit
+            
+            # Export as WAV
+            wav_buffer = io.BytesIO()
+            audio.export(wav_buffer, format="wav")
+            wav_buffer.seek(0)
+            
+            return wav_buffer.read()
+            
+        except Exception as e:
+            print(f"Error converting audio to WAV: {str(e)}")
+            # If conversion fails, return original bytes and hope for the best
+            return audio_bytes
 
     def process_audio_stream(self, audio_bytes: bytes, session_id: str) -> Dict:
         """
@@ -105,6 +133,9 @@ class SpeechTranslationService:
         Returns: (recognized_text, detected_language)
         """
         try:
+            # Convert audio to WAV format (16kHz, mono, 16-bit PCM) required by Azure Speech SDK
+            wav_data = self.convert_to_wav(audio_bytes)
+            
             # Create speech config
             speech_config = speechsdk.SpeechConfig(
                 subscription=self.subscription_key,
@@ -116,9 +147,9 @@ class SpeechTranslationService:
                 languages=list(self.language_map.values())
             )
 
-            # Create audio config from bytes
+            # Create audio config from WAV bytes
             audio_stream = speechsdk.audio.PushAudioInputStream()
-            audio_stream.write(audio_bytes)
+            audio_stream.write(wav_data)
             audio_stream.close()
 
             audio_config = speechsdk.audio.AudioConfig(stream=audio_stream)
