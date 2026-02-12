@@ -2,8 +2,11 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install ffmpeg for audio conversion (required by pydub)
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Azure Speech SDK requires these system libraries on Linux
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
