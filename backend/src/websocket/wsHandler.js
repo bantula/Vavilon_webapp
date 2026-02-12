@@ -12,12 +12,22 @@ const {
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 
 // Track all WebSocket connections
-const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage }
+const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage, traceId, seqNo }
+
+// Structured log helper
+function slog(level, component, step, fields = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    component,
+    step,
+    ...fields
+  };
+  console.log(JSON.stringify(entry));
+}
 
 /**
  * Create a WAV (RIFF) header for raw PCM data.
- * Used by bypass mode to wrap speaker's raw PCM so the browser's
- * decodeAudioData() can decode it without any changes to the listener.
  */
 function createWavHeader(dataLength, sampleRate = 16000, bitsPerSample = 16, channels = 1) {
   const header = Buffer.alloc(44);
@@ -46,13 +56,16 @@ function setupWebSocket(server) {
 
   wss.on('connection', (ws) => {
     const connectionId = uuidv4();
-    console.log(`WebSocket connected: ${connectionId}`);
+    slog('info', 'node', 'ws_connect', { connectionId });
 
     connections.set(connectionId, {
       ws,
       sessionId: null,
       role: null,
-      language: null
+      language: null,
+      sourceLanguage: null,
+      traceId: null,
+      seqNo: 0
     });
 
     ws.on('message', async (message) => {
@@ -60,7 +73,6 @@ function setupWebSocket(server) {
         const data = JSON.parse(message);
         await handleMessage(connectionId, data);
       } catch (error) {
-        // Not JSON = binary audio data from speaker
         handleBinaryMessage(connectionId, message);
       }
     });
@@ -70,12 +82,12 @@ function setupWebSocket(server) {
     });
 
     ws.on('error', (error) => {
-      console.error(`WebSocket error (${connectionId}):`, error.message);
+      slog('error', 'node', 'ws_error', { connectionId, error: error.message });
       handleDisconnect(connectionId);
     });
   });
 
-  console.log('WebSocket server ready');
+  slog('info', 'node', 'ws_ready', { path: '/ws' });
 }
 
 async function handleMessage(connectionId, data) {
@@ -102,14 +114,14 @@ async function handleMessage(connectionId, data) {
       await handleSpeakerDisconnect(connectionId);
       break;
     default:
-      console.warn(`Unknown message type: ${data.type}`);
+      slog('warn', 'node', 'unknown_msg', { connectionId, type: data.type });
   }
 }
 
 function handleBinaryMessage(connectionId, buffer) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
-  forwardAudioToAI(conn.sessionId, buffer);
+  forwardAudioToAI(conn.sessionId, buffer, conn);
 }
 
 async function handleSpeakerJoin(connectionId, payload) {
@@ -135,7 +147,7 @@ async function handleSpeakerJoin(connectionId, payload) {
     }
   });
 
-  console.log(`Speaker joined session: ${sessionId}`);
+  slog('info', 'node', 'speaker_join', { sessionId, connectionId });
 }
 
 async function handleListenerJoin(connectionId, payload) {
@@ -164,12 +176,11 @@ async function handleListenerJoin(connectionId, payload) {
     payload: { sessionId: session.id, language }
   });
 
-  console.log(`Listener joined session: ${session.id} (${language})`);
+  slog('info', 'node', 'listener_join', { sessionId: session.id, connectionId, language });
 }
 
 /**
- * Speaker clicked "Start Speaking" - tell AI service to create a
- * persistent TranslationSession with continuous recognition.
+ * Speaker clicked "Start Speaking" — generate trace_id, tell AI service.
  */
 async function handleStartSpeaking(connectionId, payload) {
   const conn = connections.get(connectionId);
@@ -177,94 +188,136 @@ async function handleStartSpeaking(connectionId, payload) {
 
   const { sourceLanguage, targetLanguages } = payload;
 
-  // Store source language for bypass routing
+  // Generate trace_id for this speaking session
   conn.sourceLanguage = sourceLanguage || 'en-US';
+  conn.traceId = uuidv4();
+  conn.seqNo = 0;
+
+  slog('info', 'node', 'start_speaking', {
+    sessionId: conn.sessionId,
+    traceId: conn.traceId,
+    sourceLanguage: conn.sourceLanguage,
+    targetLanguages: targetLanguages || ['es', 'fr', 'de']
+  });
 
   try {
-    await axios.post(`${AI_SERVICE_URL}/start-session`, {
+    const resp = await axios.post(`${AI_SERVICE_URL}/start-session`, {
       sessionId: conn.sessionId,
+      traceId: conn.traceId,
       sourceLanguage: conn.sourceLanguage,
       targetLanguages: targetLanguages || ['es', 'fr', 'de']
-    }, { timeout: 10000 });
+    }, { timeout: 15000 });
 
-    console.log(`AI session started for ${conn.sessionId}`);
+    slog('info', 'node', 'ai_session_started', {
+      sessionId: conn.sessionId,
+      traceId: conn.traceId,
+      aiResponse: resp.data
+    });
 
     sendMessage(connectionId, {
       type: 'speaking_started',
-      payload: {}
+      payload: { traceId: conn.traceId }
     });
   } catch (error) {
-    console.error('Error starting AI session:', error.message);
+    const errData = error.response?.data || error.message;
+    slog('error', 'node', 'ai_session_start_fail', {
+      sessionId: conn.sessionId,
+      traceId: conn.traceId,
+      error: errData
+    });
     sendError(connectionId, 'Failed to start translation session');
   }
 }
 
 /**
- * Speaker clicked "Stop Speaking" - tell AI service to stop.
+ * Speaker clicked "Stop Speaking".
  */
 async function handleStopSpeaking(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
 
+  slog('info', 'node', 'stop_speaking', {
+    sessionId: conn.sessionId,
+    traceId: conn.traceId,
+    totalChunks: conn.seqNo
+  });
+
   try {
     await axios.post(`${AI_SERVICE_URL}/end-session`, {
-      sessionId: conn.sessionId
+      sessionId: conn.sessionId,
+      traceId: conn.traceId
     }, { timeout: 10000 });
-
-    console.log(`AI session ended for ${conn.sessionId}`);
   } catch (error) {
-    console.error('Error ending AI session:', error.message);
+    slog('error', 'node', 'ai_session_end_fail', {
+      sessionId: conn.sessionId,
+      error: error.message
+    });
   }
 }
 
 /**
- * Forward audio chunk (JSON base64) to AI service,
- * and bypass-stream to same-language listeners.
+ * Forward audio chunk to AI + bypass to same-language listeners.
  */
 async function handleAudioChunk(connectionId, payload) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
 
-  // Forward to AI service for translation (existing flow)
-  forwardAudioToAI(conn.sessionId, payload.audioData);
+  conn.seqNo++;
+
+  // Forward to AI service for translation
+  forwardAudioToAI(conn.sessionId, payload.audioData, conn);
 
   // Bypass: stream raw audio directly to same-language listeners
   if (conn.sourceLanguage) {
-    const sourceShort = conn.sourceLanguage.split('-')[0]; // 'en-US' → 'en'
+    const sourceShort = conn.sourceLanguage.split('-')[0];
     broadcastBypassAudio(conn.sessionId, sourceShort, payload.audioData);
   }
 }
 
 /**
- * Forward audio data to the AI service's /process-audio endpoint.
- * The AI service pushes it into the PushAudioInputStream for
- * continuous recognition.
+ * Forward audio to AI service with trace metadata.
  */
-async function forwardAudioToAI(sessionId, audioData) {
+async function forwardAudioToAI(sessionId, audioData, conn) {
   try {
     const base64Audio = typeof audioData === 'string'
       ? audioData
       : audioData.toString('base64');
 
+    const seqNo = conn ? conn.seqNo : 0;
+    const traceId = conn ? conn.traceId : null;
+
+    // Log every 50th chunk to avoid log spam
+    if (seqNo % 50 === 1) {
+      slog('debug', 'node', 'forward_audio', {
+        sessionId,
+        traceId,
+        seqNo,
+        bytes: Buffer.from(base64Audio, 'base64').length
+      });
+    }
+
     await axios.post(`${AI_SERVICE_URL}/process-audio`, {
       sessionId,
+      traceId,
+      seqNo,
       audioData: base64Audio
     }, { timeout: 10000 });
   } catch (error) {
-    // Don't spam logs - only log non-404 errors (404 = session not started yet)
     if (!error.response || error.response.status !== 404) {
-      console.error('Error forwarding audio:', error.message);
+      slog('error', 'node', 'forward_audio_fail', {
+        sessionId,
+        error: error.response?.data || error.message,
+        status: error.response?.status
+      });
     }
   }
 }
 
 /**
- * Bypass mode: wrap raw PCM in a WAV header and stream directly to
+ * Bypass mode: wrap raw PCM in WAV header and stream directly to
  * listeners whose selected language matches the speaker's source language.
- * Uses in-memory connections Map (no Redis roundtrip) for low latency.
  */
 function broadcastBypassAudio(sessionId, language, pcmBase64) {
-  // Find same-language listeners from in-memory Map (O(n) but fast for <200 conns)
   const listeners = [];
   for (const [connId, conn] of connections) {
     if (conn.sessionId === sessionId &&
@@ -277,13 +330,11 @@ function broadcastBypassAudio(sessionId, language, pcmBase64) {
 
   if (listeners.length === 0) return;
 
-  // Wrap PCM in WAV header once for all listeners
   const pcmBuffer = Buffer.from(pcmBase64, 'base64');
   const wavHeader = createWavHeader(pcmBuffer.length);
   const wavBuffer = Buffer.concat([wavHeader, pcmBuffer]);
   const wavBase64 = wavBuffer.toString('base64');
 
-  // Pre-stringify so we don't repeat JSON.stringify per listener
   const message = JSON.stringify({
     type: 'bypass_audio',
     payload: { audioData: wavBase64 }
@@ -295,19 +346,21 @@ function broadcastBypassAudio(sessionId, language, pcmBase64) {
 }
 
 /**
- * Broadcast translated audio and/or subtitles to listeners.
- * Called by the AI service via POST /api/broadcast.
+ * Broadcast translated audio/subtitles to listeners.
+ * Called by AI service via POST /api/broadcast.
  */
 async function broadcastToListeners(sessionId, language, audioData, subtitleText) {
   const listenerIds = await getListenersByLanguage(sessionId, language);
 
-  console.log(`Broadcasting to ${listenerIds.length} listeners for ${language} in session ${sessionId}`);
-  if (audioData) {
-    console.log(`  Audio data length: ${audioData.length} chars`);
-  }
-  if (subtitleText) {
-    console.log(`  Subtitle: "${subtitleText}"`);
-  }
+  slog('info', 'node', 'broadcast', {
+    sessionId,
+    language,
+    listenerCount: listenerIds.length,
+    hasAudio: !!audioData,
+    audioLen: audioData ? audioData.length : 0,
+    hasSubtitle: !!subtitleText,
+    subtitleText: subtitleText ? subtitleText.substring(0, 80) : null
+  });
 
   listenerIds.forEach(connectionId => {
     const conn = connections.get(connectionId);
@@ -319,30 +372,29 @@ async function broadcastToListeners(sessionId, language, audioData, subtitleText
         });
       }
       if (audioData) {
-        console.log(`  Sending audio to connection ${connectionId}`);
         sendMessage(connectionId, {
           type: 'audio',
           payload: { audioData, language }
         });
       }
     } else {
-      console.log(`  Connection ${connectionId} is not open (state: ${conn?.ws.readyState})`);
+      slog('warn', 'node', 'broadcast_skip', {
+        connectionId,
+        reason: 'not_open',
+        state: conn?.ws.readyState
+      });
     }
   });
-
-  if (listenerIds.length > 0) {
-    console.log(`Broadcast to ${listenerIds.length} listeners (${language})`);
-  }
 }
 
 async function handleSpeakerDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
 
-  // Stop AI session
   try {
     await axios.post(`${AI_SERVICE_URL}/end-session`, {
-      sessionId: conn.sessionId
+      sessionId: conn.sessionId,
+      traceId: conn.traceId
     }, { timeout: 5000 });
   } catch (error) {
     // ignore
@@ -350,7 +402,6 @@ async function handleSpeakerDisconnect(connectionId) {
 
   await setSpeakerConnected(conn.sessionId, false);
 
-  // Notify listeners
   const session = await getSession(conn.sessionId);
   if (session && session.listeners) {
     for (const [language, listeners] of Object.entries(session.listeners)) {
@@ -363,7 +414,7 @@ async function handleSpeakerDisconnect(connectionId) {
     }
   }
 
-  console.log(`Speaker disconnected from session: ${conn.sessionId}`);
+  slog('info', 'node', 'speaker_disconnect', { sessionId: conn.sessionId, traceId: conn.traceId });
 }
 
 async function handleDisconnect(connectionId) {
