@@ -170,16 +170,76 @@ VITE_BACKEND_URL=http://localhost:3000      # or https://vavilon-backend.azurewe
 
 ## Azure Speech SDK Patterns (critical)
 
-The AI service uses `azure-cognitiveservices-speech` with this pattern:
+### SpeechRecognizer vs TranslationRecognizer
 
-1. **PushAudioInputStream** — browser audio is pushed in as raw PCM (16kHz/16-bit/mono)
-2. **SpeechTranslationConfig** — combined STT + translation in one recognizer
-3. **TranslationRecognizer.start_continuous_recognition_async()** — persistent, not per-chunk
-4. **recognized callback** — `evt.result.translations[lang_code]` gives translated text
-5. **Per-language SpeechSynthesizer** — `audio_config=None` returns WAV bytes in `result.audio_data`
-6. **Threading** — one synthesis thread per target language, pulls from a queue
+| | `SpeechRecognizer` | `TranslationRecognizer` |
+|---|---|---|
+| **Config class** | `SpeechConfig` | `SpeechTranslationConfig` |
+| **What it does** | STT only (speech → text) | STT + Translation in one step |
+| **Result reason** | `RecognizedSpeech` | `TranslatedSpeech` |
+| **How to get text** | `result.text` (source language only) | `result.text` (source) + `result.translations[lang]` (translated) |
+| **Target languages** | N/A | Must call `add_target_language()` |
+| **When to use** | Same-language transcription | Cross-language translation (Vavilon's primary use case) |
 
-Language maps in `speech_service.py`:
+**CRITICAL**: Vavilon MUST use `TranslationRecognizer` for all translation sessions. If you accidentally use `SpeechRecognizer`, you'll get `RecognizedSpeech` events with `result.text` but **NO translations** — and the code will silently produce nothing.
+
+### Translation Pipeline Architecture
+
+```
+Browser Mic → [PCM 16kHz Int16] → WebSocket → Node.js Backend
+  → HTTP POST /process-audio → Python AI Service
+    → PushAudioInputStream → Azure TranslationRecognizer
+      → STT + Translation (result.translations[lang])
+        → Subtitle broadcast (HTTP POST /api/broadcast)
+        → TTS queue per language
+          → SpeechSynthesizer (SDK) or REST API (fallback)
+            → Audio broadcast (HTTP POST /api/broadcast)
+              → Node.js Backend → WebSocket → Listener Browser
+```
+
+### Language Code Formats
+
+Three different code formats are used — do NOT mix them up:
+
+| Format | Where used | Example |
+|--------|-----------|---------|
+| **Short code** (`es`) | Frontend, listener registration, target_languages list, broadcast language key | `'es'`, `'fr'`, `'zh'` |
+| **Translation code** (`es`, `zh-Hans`) | `add_target_language()`, `result.translations` keys | `'es'`, `'zh-Hans'` (NOT `'es-ES'`) |
+| **Locale** (`es-ES`) | `speech_recognition_language`, TTS voice config | `'en-US'`, `'es-ES'` (NOT `'es'`) |
+
+Maps in `speech_service.py`:
+- `TRANSLATION_LANG_MAP`: short → translation code (e.g., `'zh'` → `'zh-Hans'`)
+- `TTS_LOCALE_MAP`: short → locale (e.g., `'es'` → `'es-ES'`)
+- `TTS_VOICE_MAP`: locale → neural voice name (e.g., `'es-ES'` → `'es-ES-ElviraNeural'`)
+
+### Common Translation Failure Points
+
+1. **Using `SpeechRecognizer` instead of `TranslationRecognizer`** — no translations produced
+2. **Using locale format (`es-ES`) in `add_target_language()`** — must use short/translation code (`es`)
+3. **Reading `result.text` instead of `result.translations[lang]`** — gets source text, not translated
+4. **TTS synthesizing source text instead of translated text** — must send `translations[lang]` to TTS
+5. **Missing `add_target_language()` call** — no translations in result even with correct recognizer
+6. **Language key mismatch in broadcast** — AI sends `'es'` but listeners registered under different key
+
+### SDK Setup Pattern (matches working standalone script)
+
+```python
+# 1. Config — MUST be SpeechTranslationConfig (not SpeechConfig)
+config = speechsdk.translation.SpeechTranslationConfig(subscription=key, region=region)
+config.speech_recognition_language = 'en-US'         # Locale format
+config.add_target_language('es')                       # Short/translation code (NOT 'es-ES')
+
+# 2. Recognizer — MUST be TranslationRecognizer (not SpeechRecognizer)
+recognizer = speechsdk.translation.TranslationRecognizer(translation_config=config, audio_config=audio)
+
+# 3. In recognized callback:
+#    reason == TranslatedSpeech (not RecognizedSpeech)
+#    translated = result.translations['es'] (not result.text)
+
+# 4. TTS — synthesize the TRANSLATED text
+synthesizer.speak_text_async(translated_text)  # NOT source_text
+```
+
 ```python
 TRANSLATION_LANG_MAP = {
     'en': 'en', 'es': 'es', 'fr': 'fr', 'de': 'de', 'it': 'it',
@@ -280,6 +340,21 @@ Speaker mic → audio_chunk → Node backend
 ---
 
 ## Current Issues (Feb 12, 2026)
+
+### ✅ Translation Pipeline Alignment - FIXED
+**Status**: Audited and aligned with working standalone `live_translation_test.py`
+**Symptom**: English → English (bypass) worked, English → Other Language failed in online version. Standalone script proved Azure credentials and SDK work correctly.
+
+**Changes Applied**:
+1. ✅ **Explicit voice names on SDK synthesizers** — Added `speech_synthesis_voice_name` (e.g., `es-ES-ElviraNeural`) to match working standalone script. Previously only `speech_synthesis_language` was set.
+2. ✅ **Input validation** — `TranslationSession.__init__` and `app.py /start-session` now fail loudly if `target_languages` is empty, `source_language` is missing, or Azure credentials are empty.
+3. ✅ **RecognizedSpeech handler** — If Azure returns `RecognizedSpeech` instead of `TranslatedSpeech`, a detailed diagnostic error is logged explaining that speech was recognized but NOT translated.
+4. ✅ **Audio flow logging** — `push_audio()` now logs every 50th push to confirm audio data is flowing into the SDK stream.
+5. ✅ **Partial recognition logging** — First 3 partials logged at info level to confirm audio IS reaching Azure.
+6. ✅ **Translation diagnostic logging** — Every recognition logs: recognizer type, source language, recognized text, translation keys, translated text, and the text sent to TTS.
+7. ✅ **Recognizer type assertion** — `assert isinstance(recognizer, TranslationRecognizer)` guards against accidental SpeechRecognizer usage.
+
+---
 
 ### ✅ Azure Speech SDK Error 2176 - FIXED
 **Status**: Root cause identified and fixed

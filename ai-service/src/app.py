@@ -99,8 +99,18 @@ def start_session():
         if not session_id:
             return jsonify({'error': 'Missing sessionId'}), 400
 
+        if not source_language:
+            return jsonify({'error': 'Missing sourceLanguage'}), 400
+
+        if not target_languages or len(target_languages) == 0:
+            return jsonify({'error': 'Missing or empty targetLanguages — '
+                           'at least one target language is required'}), 400
+
         slog('info', 'start_session', session_id=session_id, trace_id=trace_id,
-             source=source_language, targets=target_languages)
+             source=source_language, targets=target_languages,
+             target_count=len(target_languages),
+             azure_key_set=bool(AZURE_SPEECH_KEY),
+             azure_region=AZURE_SPEECH_REGION)
 
         # Stop existing session if any
         if session_id in sessions:
