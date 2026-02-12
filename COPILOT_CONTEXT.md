@@ -279,6 +279,58 @@ Speaker mic → audio_chunk → Node backend
 
 ---
 
+## Current Issues (Feb 12, 2026)
+
+### CORS Configuration Problem - IN PROGRESS
+**Status**: Both production URLs failing with CORS errors  
+**Symptoms**:
+- Browser console shows: `Access to fetch at 'https://vavilon-backend.azurewebsites.net/api/sessions' from origin 'https://green-pond-05766a403.1.azurestaticapps.net' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource.`
+- www.vavilonapp.rs redirects to green-pond URL, both fail equally
+- Frontend environment variable issue fixed (VITE_BACKEND_URL now set correctly)
+- Backend health check responds but returns NO CORS headers
+
+**Root Cause Investigation**:
+1. Azure App Service has its own CORS middleware that runs BEFORE Express
+2. Initially Azure CORS was configured but missing green-pond URL
+3. Cleared Azure CORS configuration to let Express handle it
+4. Express CORS middleware still not sending headers - suggests deployment issue
+
+**Express CORS Configuration** (in `backend/src/index.js`):
+```javascript
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'https://green-pond-05766a403.1.azurestaticapps.net',
+    'https://vavilonapp.rs',
+    'https://www.vavilonapp.rs'
+  ],
+  credentials: true
+}));
+```
+
+**Azure CORS Configuration** (Platform level):
+- Was set to only: vavilonapp.rs, www.vavilonapp.rs, vavilon-app.azurestaticapps.net
+- **Fixed**: Cleared all Azure CORS (set to empty array) to use Express CORS only
+- Command: `az resource update --ids "/.../config/web" --set properties.cors.allowedOrigins="[]"`
+
+**Next Steps**:
+1. ✅ Cleared Azure App Service CORS configuration
+2. ⏳ Trigger full backend redeployment via GitHub Actions to ensure cors npm package is installed
+3. ⏳ Verify backend responds with Access-Control-Allow-Origin header
+4. ⏳ Test both production URLs
+
+**Testing Commands**:
+```powershell
+# Test CORS header presence
+$response = Invoke-WebRequest -Uri "https://vavilon-backend.azurewebsites.net/health" -Method GET -Headers @{"Origin"="https://green-pond-05766a403.1.azurestaticapps.net"}  -UseBasicParsing
+$response.Headers['Access-Control-Allow-Origin']  # Should return the origin
+
+# Test OPTIONS preflight
+Invoke-WebRequest -Uri "https://vavilon-backend.azurewebsites.net/api/sessions" -Method OPTIONS -Headers @{"Origin"="https://green-pond-05766a403.1.azurestaticapps.net"; "Access-Control-Request-Method"="POST"}
+```
+
+---
+
 ## Known Issues / TODOs
 
 1. **ScriptProcessorNode is deprecated** — works fine but browsers recommend AudioWorklet. Low priority.
@@ -286,6 +338,7 @@ Speaker mic → audio_chunk → Node backend
 3. **In-memory AI sessions** — if the AI container restarts, active translation sessions are lost.
 4. **Express body limit** set to 5MB (`express.json({ limit: '5mb' })`) to allow TTS audio payloads.
 5. **After code changes, all 3 services need redeployment** to test end-to-end.
+6. **Backend logs show AI service timeouts** — "timeout of 10000ms exceeded" when forwarding audio. Need to verify AI service accessibility from backend.
 
 ---
 
