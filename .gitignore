@@ -54,4 +54,8 @@ temp/
 # Claude local settings
 .claude/
 
+# Test files
 nul
+voice_test.wav
+voice_test_16k.wav
+*.wav
