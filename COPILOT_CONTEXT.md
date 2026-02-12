@@ -281,53 +281,43 @@ Speaker mic → audio_chunk → Node backend
 
 ## Current Issues (Feb 12, 2026)
 
-### CORS Configuration Problem - IN PROGRESS
-**Status**: Both production URLs failing with CORS errors  
-**Symptoms**:
-- Browser console shows: `Access to fetch at 'https://vavilon-backend.azurewebsites.net/api/sessions' from origin 'https://green-pond-05766a403.1.azurestaticapps.net' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource.`
-- www.vavilonapp.rs redirects to green-pond URL, both fail equally
-- Frontend environment variable issue fixed (VITE_BACKEND_URL now set correctly)
-- Backend health check responds but returns NO CORS headers
+### ✅ CORS Configuration Problem - RESOLVED
+**Status**: FIXED - Both production URLs now working  
+**Resolution Date**: Feb 12, 2026 19:35 UTC
 
-**Root Cause Investigation**:
-1. Azure App Service has its own CORS middleware that runs BEFORE Express
-2. Initially Azure CORS was configured but missing green-pond URL
-3. Cleared Azure CORS configuration to let Express handle it
-4. Express CORS middleware still not sending headers - suggests deployment issue
+**Problem Summary**:
+- Browser console showed CORS errors: "No 'Access-Control-Allow-Origin' header is present"
+- Both www.vavilonapp.rs and green-pond URL failed to connect to backend
+- OPTIONS preflight requests returned 400 Bad Request
 
-**Express CORS Configuration** (in `backend/src/index.js`):
-```javascript
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'https://green-pond-05766a403.1.azurestaticapps.net',
-    'https://vavilonapp.rs',
-    'https://www.vavilonapp.rs'
-  ],
-  credentials: true
-}));
-```
+**Root Causes**:
+1. **Azure App Service CORS** was configured but missing the actual frontend URL (green-pond-05766a403.1.azurestaticapps.net)
+2. **Azure CORS runs BEFORE Express** - conflicting with Express CORS middleware
+3. **Backend deployment** didn't properly install/load the `cors` npm package
 
-**Azure CORS Configuration** (Platform level):
-- Was set to only: vavilonapp.rs, www.vavilonapp.rs, vavilon-app.azurestaticapps.net
-- **Fixed**: Cleared all Azure CORS (set to empty array) to use Express CORS only
-- Command: `az resource update --ids "/.../config/web" --set properties.cors.allowedOrigins="[]"`
+**Solution Applied**:
+1. ✅ Cleared Azure App Service CORS configuration entirely (set to `allowedOrigins: []`)
+2. ✅ Redeployed backend via GitHub Actions to ensure proper `npm ci` installation of dependencies
+3. ✅ Express CORS middleware now handles all CORS (includes all required origins)
+4. ✅ Verified OPTIONS preflight and regular requests both return proper CORS headers
 
-**Next Steps**:
-1. ✅ Cleared Azure App Service CORS configuration
-2. ⏳ Trigger full backend redeployment via GitHub Actions to ensure cors npm package is installed
-3. ⏳ Verify backend responds with Access-Control-Allow-Origin header
-4. ⏳ Test both production URLs
-
-**Testing Commands**:
+**Verification Results**:
 ```powershell
-# Test CORS header presence
-$response = Invoke-WebRequest -Uri "https://vavilon-backend.azurewebsites.net/health" -Method GET -Headers @{"Origin"="https://green-pond-05766a403.1.azurestaticapps.net"}  -UseBasicParsing
-$response.Headers['Access-Control-Allow-Origin']  # Should return the origin
+# GET request test
+Status: 200
+Access-Control-Allow-Origin: https://green-pond-05766a403.1.azurestaticapps.net
 
-# Test OPTIONS preflight
-Invoke-WebRequest -Uri "https://vavilon-backend.azurewebsites.net/api/sessions" -Method OPTIONS -Headers @{"Origin"="https://green-pond-05766a403.1.azurestaticapps.net"; "Access-Control-Request-Method"="POST"}
+# OPTIONS preflight test
+Status: 204
+Access-Control-Allow-Origin: https://green-pond-05766a403.1.azurestaticapps.net
+Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE
 ```
+
+**Key Learnings**:
+- **Azure App Service has platform-level CORS that intercepts requests BEFORE they reach Express**
+- **Setting Azure CORS to empty array allows Express CORS to handle everything**
+- **GitHub Actions deployment (`npm ci`) ensures proper dependency installation**
+- **Manual zip deployments may not properly install node_modules**
 
 ---
 
