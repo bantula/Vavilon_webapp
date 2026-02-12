@@ -341,6 +341,46 @@ Speaker mic → audio_chunk → Node backend
 
 ## Current Issues (Feb 12, 2026)
 
+### ✅ NODE_BACKEND_URL Missing from AI Container - FIXED
+**Status**: Root cause identified — deployment config fix required
+**Symptom**: AI service processes audio correctly (STT + translation + TTS all working for all 9 languages), but listeners receive nothing. Logs show:
+```
+"broadcast_audio_error": "HTTPConnectionPool(host='localhost', port=3000)... Max retries exceeded... Connection refused"
+```
+
+**Root Cause**:
+The `NODE_BACKEND_URL` environment variable was **not set** in the Azure Container Instance. The code in `app.py` defaults to `http://localhost:3000`:
+```python
+NODE_BACKEND_URL = os.getenv('NODE_BACKEND_URL', 'http://localhost:3000')
+```
+Inside the container, `localhost:3000` is unreachable — it needs to point to `https://vavilon-backend.azurewebsites.net`.
+
+**What was working**: Audio reception, speech recognition, translation (all 9 languages), TTS audio generation (50-70KB per language).
+**What was broken**: Broadcasting translated audio/subtitles back to the Node.js backend (HTTP POST to `/api/broadcast` failed with connection refused).
+
+**Fix**: Recreate the container with the correct environment variable:
+```powershell
+az container create `
+  --name vavilon-ai `
+  --resource-group vavilon-rg `
+  --image vavilonacr.azurecr.io/vavilon-ai:latest `
+  --registry-login-server vavilonacr.azurecr.io `
+  --registry-username vavilonacr `
+  --registry-password <ACR_PASSWORD> `
+  --os-type Linux --cpu 1 --memory 1.5 `
+  --dns-name-label vavilon-ai `
+  --ports 5000 `
+  --environment-variables `
+    PORT=5000 `
+    AZURE_SPEECH_KEY=<key> `
+    AZURE_SPEECH_REGION=westeurope `
+    NODE_BACKEND_URL=https://vavilon-backend.azurewebsites.net
+```
+
+**Key Learning**: `az container restart` preserves env vars, but if the container was originally created without `NODE_BACKEND_URL`, restarting won't add it. Must use `az container create` to update env vars (it replaces the container).
+
+---
+
 ### ✅ Translation Pipeline Alignment - FIXED
 **Status**: Audited and aligned with working standalone `live_translation_test.py`
 **Symptom**: English → English (bypass) worked, English → Other Language failed in online version. Standalone script proved Azure credentials and SDK work correctly.
@@ -443,9 +483,34 @@ az webapp deployment source config-zip --resource-group vavilon-rg --name vavilo
 ```powershell
 cd ai-service
 az acr build --registry vavilonacr --image vavilon-ai:latest .
-# Restart the container instance to pick up new image
+
+# IMPORTANT: If you need to add/change env vars, you MUST recreate the container
+# (az container restart does NOT update env vars):
+az container create `
+  --name vavilon-ai --resource-group vavilon-rg `
+  --image vavilonacr.azurecr.io/vavilon-ai:latest `
+  --registry-login-server vavilonacr.azurecr.io `
+  --registry-username vavilonacr `
+  --registry-password <ACR_PASSWORD> `
+  --os-type Linux --cpu 1 --memory 1.5 `
+  --dns-name-label vavilon-ai --ports 5000 `
+  --environment-variables `
+    PORT=5000 `
+    AZURE_SPEECH_KEY=<key> `
+    AZURE_SPEECH_REGION=westeurope `
+    NODE_BACKEND_URL=https://vavilon-backend.azurewebsites.net
+
+# If ONLY updating the image (env vars already correct), restart is enough:
 az container restart --resource-group vavilon-rg --name vavilon-ai
 ```
+
+**Critical env vars for AI container** (all required):
+| Variable | Value | What breaks if missing |
+|----------|-------|----------------------|
+| `AZURE_SPEECH_KEY` | Your Speech Services key | Session creation fails (500) |
+| `AZURE_SPEECH_REGION` | `westeurope` | Session creation fails (500) |
+| `NODE_BACKEND_URL` | `https://vavilon-backend.azurewebsites.net` | Translations work but never reach listeners (broadcasts to localhost fail) |
+| `PORT` | `5000` | Container listens on wrong port |
 
 ### Frontend
 Auto-deploys via GitHub Actions when pushed to main (Static Web Apps).
