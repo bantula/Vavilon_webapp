@@ -81,6 +81,9 @@ class TranslationSession:
         self._push_count = 0
         self._partial_count = 0
         self._use_rest_tts = False  # True = REST API fallback for TTS
+        self._recognition_started = False
+        self._recognition_stopped = False
+        self._stream_closed = False
 
         # ── Validate inputs (fail loudly) ────────────────────────
         if not self.speech_key:
@@ -235,11 +238,23 @@ class TranslationSession:
     # ── Session lifecycle ───────────────────────────────────────
 
     def start(self):
-        self._log('info', 'starting_recognition')
+        self._log('info', 'starting_recognition',
+                  mode='continuous',
+                  method='start_continuous_recognition_async',
+                  note='Continuous recognition - will process multiple utterances')
         self._translation_recognizer.start_continuous_recognition_async().get()
-        self._log('info', 'recognition_started')
+        self._recognition_started = True
+        self._log('info', 'recognition_started',
+                  lifecycle_state='active',
+                  note='Recognizer now listening continuously until stop() called')
 
     def push_audio(self, audio_bytes: bytes):
+        if self._stream_closed:
+            self._log('error', 'push_audio_after_close',
+                      bytes=len(audio_bytes),
+                      note='Attempting to push audio after stream closed')
+            return
+
         self._audio_stream.write(audio_bytes)
         self._total_bytes_pushed += len(audio_bytes)
         self._push_count += 1
@@ -251,37 +266,53 @@ class TranslationSession:
                       push_no=self._push_count,
                       chunk_bytes=len(audio_bytes),
                       total_bytes=self._total_bytes_pushed,
-                      total_audio_seconds=total_sec)
+                      total_audio_seconds=total_sec,
+                      recognition_active=self._recognition_started and not self._recognition_stopped,
+                      stream_open=not self._stream_closed)
 
     def stop(self):
-        self._log('info', 'stopping', total_bytes=self._total_bytes_pushed,
-                  recognize_count=self._recognize_count)
+        self._log('info', 'stopping',
+                  total_bytes=self._total_bytes_pushed,
+                  recognize_count=self._recognize_count,
+                  lifecycle_state='stopping',
+                  note='Explicit stop() called - ending session')
         self._stop_event.set()
 
         for lang, info in self._synth_threads.items():
             info["running"] = False
 
-        if self._translation_recognizer:
+        if self._translation_recognizer and not self._recognition_stopped:
             try:
+                self._log('info', 'stopping_recognition',
+                          method='stop_continuous_recognition_async')
                 self._translation_recognizer.stop_continuous_recognition_async().get()
+                self._recognition_stopped = True
+                self._log('info', 'recognition_stopped')
             except Exception as e:
                 self._log('error', 'stop_recognizer_fail', error=str(e))
 
-        try:
-            self._audio_stream.close()
-        except Exception:
-            pass
+        if not self._stream_closed:
+            try:
+                self._log('info', 'closing_audio_stream')
+                self._audio_stream.close()
+                self._stream_closed = True
+                self._log('info', 'audio_stream_closed')
+            except Exception as e:
+                self._log('error', 'close_stream_fail', error=str(e))
 
         for lang, info in self._synth_threads.items():
             if info["thread"].is_alive():
                 info["thread"].join(timeout=3.0)
 
-        self._log('info', 'stopped')
+        self._log('info', 'stopped', lifecycle_state='stopped')
 
     # ── Recognition callbacks ───────────────────────────────────
 
     def _on_session_started(self, evt):
-        self._log('info', 'azure_session_started')
+        self._log('info', 'azure_session_started',
+                  lifecycle_event='session_started',
+                  recognition_active=self._recognition_started,
+                  note='Azure SDK session started - recognition pipeline active')
         self._trace({
             'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
             'step': 'azure_session_started'
@@ -400,9 +431,12 @@ class TranslationSession:
     def _on_canceled(self, evt):
         cancellation = evt.cancellation_details
         self._log('error', 'recognition_canceled',
+                  lifecycle_event='canceled',
                   reason=str(cancellation.reason),
                   error_code=str(cancellation.error_code) if hasattr(cancellation, 'error_code') else '',
-                  error_details=cancellation.error_details if cancellation.error_details else '')
+                  error_details=cancellation.error_details if cancellation.error_details else '',
+                  recognition_count=self._recognize_count,
+                  note='CRITICAL: Recognition canceled - check error_details for root cause')
         self._metric('errors_total')
         self._trace({
             'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
@@ -412,7 +446,27 @@ class TranslationSession:
         })
 
     def _on_session_stopped(self, evt):
-        self._log('info', 'azure_session_stopped')
+        # This callback fires when Azure's recognition session ends.
+        # In continuous recognition, this should NOT fire unless:
+        # 1. stop_continuous_recognition() was explicitly called
+        # 2. The audio stream was closed
+        # 3. An error occurred
+        # If this fires unexpectedly (recognize_count > 0 but stop() not called),
+        # it indicates a problem.
+        was_unexpected = (self._recognize_count > 0 and 
+                          not self._stop_event.is_set() and 
+                          not self._recognition_stopped)
+        
+        self._log('warn' if was_unexpected else 'info',
+                  'azure_session_stopped',
+                  lifecycle_event='session_stopped',
+                  recognition_count=self._recognize_count,
+                  stop_called=self._stop_event.is_set(),
+                  recognition_stopped=self._recognition_stopped,
+                  unexpected=was_unexpected,
+                  note=('UNEXPECTED session stop - recognition should be continuous' 
+                        if was_unexpected else 
+                        'Normal session_stopped after explicit stop()'))
 
     # ── TTS synthesis thread ────────────────────────────────────
 

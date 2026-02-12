@@ -252,6 +252,124 @@ TTS_LOCALE_MAP = {
 }
 ```
 
+### Continuous Recognition Lifecycle (CRITICAL)
+
+Azure Speech SDK has two recognition modes:
+
+| Mode | Method | Behavior | Use Case |
+|------|--------|----------|----------|
+| **Single-shot** | `recognize_once_async()` | Recognizes ONE utterance, then stops | Transcribing a single sentence |
+| **Continuous** | `start_continuous_recognition_async()` | Recognizes MULTIPLE utterances until explicitly stopped | Real-time streaming (Vavilon) |
+
+**Vavilon MUST use continuous recognition** to handle multiple sentences from the speaker.
+
+#### Proper Lifecycle for WebSocket Streaming
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. WebSocket Connected (speaker joins)                      │
+│    → POST /start-session                                     │
+│       → Create PushAudioInputStream                          │
+│       → Create TranslationRecognizer                         │
+│       → Attach callbacks:                                    │
+│           • session_started                                  │
+│           • session_stopped                                  │
+│           • recognizing (partial results)                    │
+│           • recognized (final results)                       │
+│           • canceled (errors)                                │
+│       → start_continuous_recognition_async()                 │
+│       Session lifecycle: ACTIVE                              │
+├─────────────────────────────────────────────────────────────┤
+│ 2. Audio Streaming Loop                                      │
+│    → Browser sends audio_chunk via WebSocket                │
+│    → Node.js forwards to POST /process-audio                │
+│    → AI service: session.push_audio(bytes)                   │
+│       → audio_stream.write(bytes)                            │
+│       Azure recognizes continuously:                         │
+│         First sentence → recognized callback                 │
+│         Second sentence → recognized callback                │
+│         Third sentence → recognized callback                 │
+│         ... (continues until stop)                           │
+│    ⚠️ NEVER close audio_stream here                         │
+│    ⚠️ NEVER call stop_continuous_recognition here           │
+├─────────────────────────────────────────────────────────────┤
+│ 3. WebSocket Disconnected (speaker leaves)                  │
+│    → POST /end-session                                       │
+│       → session.stop()                                       │
+│          → stop_continuous_recognition_async()               │
+│          → audio_stream.close()                              │
+│       Session lifecycle: STOPPED                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Common Lifecycle Failure: "First Sentence Works, Then Stops"
+
+**Symptom**: First translated sentence succeeds. After that, recognition permanently stops.
+
+**Root Causes**:
+1. ❌ Using `recognize_once_async()` instead of `start_continuous_recognition_async()`
+2. ❌ Calling `audio_stream.close()` after first `recognized` callback
+3. ❌ Calling `stop_continuous_recognition()` inside `recognized` callback
+4. ❌ Recreating recognizer object per audio chunk
+5. ❌ Not storing recognizer in persistent session object
+6. ❌ `session_stopped` event firing prematurely due to stream closure
+
+**Diagnosis via Logs**:
+```json
+// Normal continuous operation (GOOD):
+{"step":"azure_session_started", "note":"recognition pipeline active"}
+{"step":"stt_recognized", "recognize_no":1, "text":"Hello"}
+{"step":"stt_recognized", "recognize_no":2, "text":"This is sentence two"}
+{"step":"stt_recognized", "recognize_no":3, "text":"And sentence three"}
+{"step":"azure_session_stopped", "unexpected":false} // Only when stop() called
+
+// Premature stop (BAD):
+{"step":"azure_session_started"}
+{"step":"stt_recognized", "recognize_no":1, "text":"Hello"}
+{"step":"azure_session_stopped", "unexpected":true, "note":"UNEXPECTED session stop"}
+// ↑ session_stopped fired after first recognition — ROOT CAUSE
+```
+
+#### Lifecycle Rules (MUST FOLLOW)
+
+1. ✅ **One recognizer per speaker session** — created in `__init__`, stored as `self._translation_recognizer`
+2. ✅ **Audio stream stays open** — only closed in `stop()` when WebSocket disconnects
+3. ✅ **Continuous recognition** — Use `start_continuous_recognition_async()`, NOT `recognize_once_async()`
+4. ✅ **Never stop in callbacks** — `recognized` callback processes results but does NOT call `stop_continuous_recognition()`
+5. ✅ **Lifecycle state tracking** — Track `_recognition_started`, `_recognition_stopped`, `_stream_closed` to detect premature closure
+6. ✅ **Explicit stop only** — `stop_continuous_recognition()` and `audio_stream.close()` only called in `session.stop()` method
+
+#### Implementation Pattern (Correct)
+
+```python
+class TranslationSession:
+    def __init__(self, ...):
+        self._audio_stream = speechsdk.audio.PushAudioInputStream(...)
+        self._recognizer = speechsdk.translation.TranslationRecognizer(...)
+        self._recognizer.recognized.connect(self._on_recognized)
+        # Stream and recognizer persist for session lifetime
+    
+    def start(self):
+        # Start continuous recognition (will process multiple utterances)
+        self._recognizer.start_continuous_recognition_async().get()
+    
+    def push_audio(self, audio_bytes):
+        # Stream audio continuously — do NOT close stream here
+        self._audio_stream.write(audio_bytes)
+    
+    def _on_recognized(self, evt):
+        # Process each recognized sentence
+        # DO NOT call stop_continuous_recognition here
+        # DO NOT close audio_stream here
+        translated = evt.result.translations['es']
+        self._broadcast(translated)
+    
+    def stop(self):
+        # Only called when WebSocket disconnects
+        self._recognizer.stop_continuous_recognition_async().get()
+        self._audio_stream.close()
+```
+
 ---
 
 ## Browser Audio Capture (critical)
