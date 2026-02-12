@@ -84,7 +84,7 @@ Resource group: `vavilon-rg`
 |------|---------|
 | `ai-service/src/app.py` | Flask server with `/start-session`, `/process-audio`, `/end-session` |
 | `ai-service/src/speech_service.py` | `TranslationSession` class — Azure SDK continuous recognition + TTS |
-| `ai-service/Dockerfile` | Python 3.9 slim container with Azure Speech SDK system deps |
+| `ai-service/Dockerfile` | Python 3.9-bullseye container with Azure Speech SDK system deps (libssl1.1) |
 | `ai-service/requirements.txt` | flask, flask-cors, azure-cognitiveservices-speech, requests, python-dotenv |
 
 ### Frontend (React + Vite)
@@ -242,7 +242,7 @@ Speaker mic → audio_chunk → Node backend
 |---|---|---|
 | Trigger | listener lang != speaker lang | listener lang == speaker lang |
 | Pipeline | Speaker → Backend → AI → Backend → Listener | Speaker → Backend → Listener |
-| Audio format | WAV from TTS (24kHz) | WAV-wrapped PCM (16kHz) |
+| Audio format | WAV from TTS (16kHz, SDK or REST) | WAV-wrapped PCM (16kHz) |
 | Message type | `audio` + `subtitle` | `bypass_audio` |
 | Latency | ~2-5s (STT + translate + TTS) | ~100-200ms (network only) |
 | Playback | Queue-based sequential | Time-scheduled gapless |
@@ -281,41 +281,23 @@ Speaker mic → audio_chunk → Node backend
 
 ## Current Issues (Feb 12, 2026)
 
-### ⚠️ Azure Speech SDK Error 2176 - IN PROGRESS 
-**Status**: Translation sessions failing to start - Active troubleshooting  
+### ✅ Azure Speech SDK Error 2176 - FIXED
+**Status**: Root cause identified and fixed
 **Error**: `Failed to initialize platform (azure-c-shared). Error: 2176`
 
-**Problem Summary**:
-- Users see "Failed to start translation session" when clicking "Start Speaking"
-- Backend successfully connects to AI service
-- AI service returning 500 Internal Server Error
--AI logs show Azure Speech SDK failing to create `SpeechSynthesizer`
-- Error occurs in: `synthesizer_create_speech_synthesizer_from_config`
-
 **Root Cause**:
-Azure Speech SDK error 2176 when creating TTS synthesizers in containerized environment. This is a known Azure SDK initialization issue in Docker containers.
+Azure Speech SDK **1.36.0 requires `libssl1.1`**. The Dockerfile used `python:3.9` (Debian **Bookworm/12**) which only ships **`libssl3`** and has dropped `libssl1.1`. Adding `libssl3` or `libssl-dev` didn't help because those are OpenSSL 3.x — the SDK needs OpenSSL 1.x.
 
-**Tried Solutions**:
-1. ❌ Added comprehensive system dependencies (libssl3, libssl-dev, libgcc-s1, libstdc++6, build-essential)
-2. ❌ Switched from `python:3.9-slim` to full `python:3.9` image
-3. ⏳ Next: Lazy synthesizer initialization (create on-demand vs at session start)
+**Fixes Applied**:
+1. ✅ **Dockerfile**: Changed `FROM python:3.9` → `FROM python:3.9-bullseye` (Debian 11, has `libssl1.1`)
+2. ✅ **Resilient TTS init**: `_setup_synthesizers()` now wraps SDK synthesizer creation in try/except. If SDK fails, it sets `_use_rest_tts = True` and continues — the session still starts (STT + subtitles work).
+3. ✅ **REST API TTS fallback**: New `_rest_tts()` method uses Azure TTS REST API (pure HTTP, no native libs). Falls back automatically if SDK synthesizer creation fails. Uses SSML with neural voices.
 
-**Error Stack Trace**:
-```azure-cognitiveservices-speech/libMicrosoft.CognitiveServices.Speech.core.so
-Runtime error: Failed to initialize platform (azure-c-shared). Error: 2176
-```
-
-**Impact**:
-- ✅ Frontend CORS: Fixed
-- ✅ Backend deployment: Working
-- ❌ Translation system: Broken - Cannot start sessions
-- ⚠️ Bypass mode (same-language listeners): Should still work
-
-**Next Steps**:
-1. Modify `_setup_synthesizers` to create synthesizers lazily instead of at init
-2. Test with Ubuntu-based container image
-3. Try older Azure Speech SDK version (pre-1.36.0)
-4. Contact Microsoft Azure support if issue persists
+**TTS Modes**:
+| Mode | When used | How it works |
+|------|-----------|-------------|
+| SDK | Default (SDK synthesizers created successfully) | `SpeechSynthesizer.speak_text_async()` — low latency |
+| REST | Automatic fallback (SDK creation fails) | HTTP POST to `{region}.tts.speech.microsoft.com` with SSML |
 
 ---
 

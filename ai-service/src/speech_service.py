@@ -1,5 +1,6 @@
 import azure.cognitiveservices.speech as speechsdk
 import base64
+import html
 import json
 import os
 import queue
@@ -40,6 +41,20 @@ class TranslationSession:
         'ja': 'ja-JP', 'ar': 'ar-SA'
     }
 
+    # Neural voice names for REST API TTS fallback
+    TTS_VOICE_MAP = {
+        'en-US': 'en-US-JennyNeural',
+        'es-ES': 'es-ES-ElviraNeural',
+        'fr-FR': 'fr-FR-DeniseNeural',
+        'de-DE': 'de-DE-KatjaNeural',
+        'it-IT': 'it-IT-ElsaNeural',
+        'pt-PT': 'pt-PT-RaquelNeural',
+        'ru-RU': 'ru-RU-SvetlanaNeural',
+        'zh-CN': 'zh-CN-XiaoxiaoNeural',
+        'ja-JP': 'ja-JP-NanamiNeural',
+        'ar-SA': 'ar-SA-ZariyahNeural',
+    }
+
     def __init__(self, session_id: str, trace_id: str,
                  speech_key: str, region: str,
                  source_language: str, target_languages: list,
@@ -63,6 +78,7 @@ class TranslationSession:
         self._stop_event = threading.Event()
         self._total_bytes_pushed = 0
         self._recognize_count = 0
+        self._use_rest_tts = False  # True = REST API fallback for TTS
 
         # Audio input stream: PCM 16kHz 16-bit mono
         audio_format = speechsdk.audio.AudioStreamFormat(
@@ -134,27 +150,45 @@ class TranslationSession:
         self._translation_recognizer.session_stopped.connect(self._on_session_stopped)
 
     def _setup_synthesizers(self):
+        # Create queues first (needed regardless of TTS mode)
         for lang in self.target_languages:
             self._translated_text_queues[lang] = queue.Queue()
 
-            speech_config = speechsdk.SpeechConfig(
-                subscription=self.speech_key,
-                region=self.region
-            )
-            locale = self.TTS_LOCALE_MAP.get(lang, 'en-US')
-            speech_config.speech_synthesis_language = locale
+        # Try SDK-based synthesizers first
+        try:
+            for lang in self.target_languages:
+                speech_config = speechsdk.SpeechConfig(
+                    subscription=self.speech_key,
+                    region=self.region
+                )
+                locale = self.TTS_LOCALE_MAP.get(lang, 'en-US')
+                speech_config.speech_synthesis_language = locale
 
-            # RIFF WAV 16kHz 16-bit mono — smaller than 24kHz, stays well under
-            # the Express 5MB body limit even for long sentences
-            speech_config.set_speech_synthesis_output_format(
-                speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
-            )
+                # RIFF WAV 16kHz 16-bit mono — smaller than 24kHz, stays well under
+                # the Express 5MB body limit even for long sentences
+                speech_config.set_speech_synthesis_output_format(
+                    speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
+                )
 
-            self._synthesizers[lang] = speechsdk.SpeechSynthesizer(
-                speech_config=speech_config,
-                audio_config=None
-            )
+                self._synthesizers[lang] = speechsdk.SpeechSynthesizer(
+                    speech_config=speech_config,
+                    audio_config=None
+                )
+                self._log('info', 'synth_init', language=lang, locale=locale,
+                          mode='sdk', format='Riff16Khz16BitMonoPcm')
 
+        except Exception as e:
+            # SDK TTS failed (e.g. Error 2176 / missing libssl1.1).
+            # Fall back to Azure TTS REST API (pure HTTP, no native libs).
+            self._log('error', 'sdk_synth_fail', error=str(e),
+                      traceback=traceback.format_exc())
+            self._log('info', 'switching_to_rest_tts',
+                      msg='SDK SpeechSynthesizer failed, using REST API fallback')
+            self._use_rest_tts = True
+            self._synthesizers = {}
+
+        # Start TTS worker threads regardless of mode
+        for lang in self.target_languages:
             self._synth_threads[lang] = {
                 "thread": threading.Thread(
                     target=self._voice_synth,
@@ -164,9 +198,6 @@ class TranslationSession:
                 "running": True
             }
             self._synth_threads[lang]["thread"].start()
-
-            self._log('info', 'synth_init', language=lang, locale=locale,
-                      format='Riff16Khz16BitMonoPcm')
 
     # ── Session lifecycle ───────────────────────────────────────
 
@@ -303,9 +334,10 @@ class TranslationSession:
         """
         Per-language TTS thread. Pulls translated text from queue,
         synthesizes audio, broadcasts. Catches ALL exceptions to prevent
-        silent thread death.
+        silent thread death. Supports SDK and REST API modes.
         """
-        self._log('info', 'synth_thread_start', language=language)
+        mode = 'rest' if self._use_rest_tts else 'sdk'
+        self._log('info', 'synth_thread_start', language=language, mode=mode)
 
         while self._synth_threads[language]["running"]:
             try:
@@ -316,53 +348,46 @@ class TranslationSession:
             t0 = time.time()
             try:
                 self._metric('tts_calls')
-                self._log('info', 'tts_start', language=language, text=text[:60])
+                self._log('info', 'tts_start', language=language,
+                          mode=mode, text=text[:60])
 
-                result = self._synthesizers[language].speak_text_async(text).get()
+                if self._use_rest_tts:
+                    audio_bytes = self._rest_tts(language, text)
+                else:
+                    audio_bytes = self._sdk_tts(language, text)
+
                 elapsed_ms = int((time.time() - t0) * 1000)
                 self._latency('tts_latencies', elapsed_ms)
 
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    audio_bytes = result.audio_data
-                    if len(audio_bytes) == 0:
-                        self._log('error', 'tts_empty', language=language,
-                                  text=text[:60], elapsed_ms=elapsed_ms)
-                        self._metric('errors_total')
-                        continue
-
-                    self._log('info', 'tts_done', language=language,
-                              bytes=len(audio_bytes), elapsed_ms=elapsed_ms)
-                    self._trace({
-                        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-                        'step': 'tts',
-                        'language': language,
-                        'bytes': len(audio_bytes),
-                        'elapsed_ms': elapsed_ms
-                    })
-
-                    # Save TTS output for debugging
-                    if self.debug:
-                        self._save_tts_debug(language, audio_bytes)
-
-                    audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                    self._broadcast_audio(language, audio_b64)
-
-                else:
-                    self._log('error', 'tts_fail', language=language,
-                              reason=str(result.reason), elapsed_ms=elapsed_ms)
+                if not audio_bytes or len(audio_bytes) == 0:
+                    self._log('error', 'tts_empty', language=language,
+                              mode=mode, text=text[:60], elapsed_ms=elapsed_ms)
                     self._metric('errors_total')
+                    continue
 
-                    if result.reason == speechsdk.ResultReason.Canceled:
-                        cancellation = result.cancellation_details
-                        self._log('error', 'tts_canceled',
-                                  language=language,
-                                  cancel_reason=str(cancellation.reason),
-                                  error_details=cancellation.error_details or '')
+                self._log('info', 'tts_done', language=language,
+                          mode=mode, bytes=len(audio_bytes),
+                          elapsed_ms=elapsed_ms)
+                self._trace({
+                    'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                    'step': 'tts',
+                    'language': language,
+                    'mode': mode,
+                    'bytes': len(audio_bytes),
+                    'elapsed_ms': elapsed_ms
+                })
+
+                if self.debug:
+                    self._save_tts_debug(language, audio_bytes)
+
+                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                self._broadcast_audio(language, audio_b64)
 
             except Exception as e:
                 # CRITICAL: catch all so the thread never dies
                 self._log('error', 'tts_exception', language=language,
-                          error=str(e), traceback=traceback.format_exc())
+                          mode=mode, error=str(e),
+                          traceback=traceback.format_exc())
                 self._metric('errors_total')
             finally:
                 try:
@@ -371,6 +396,63 @@ class TranslationSession:
                     pass
 
         self._log('info', 'synth_thread_exit', language=language)
+
+    def _sdk_tts(self, language, text):
+        """Synthesize speech using Azure Speech SDK (native library)."""
+        result = self._synthesizers[language].speak_text_async(text).get()
+
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            return result.audio_data
+
+        self._log('error', 'sdk_tts_fail', language=language,
+                  reason=str(result.reason))
+
+        if result.reason == speechsdk.ResultReason.Canceled:
+            cancellation = result.cancellation_details
+            self._log('error', 'sdk_tts_canceled', language=language,
+                      cancel_reason=str(cancellation.reason),
+                      error_details=cancellation.error_details or '')
+
+        return None
+
+    def _rest_tts(self, language, text):
+        """
+        Synthesize speech using Azure TTS REST API.
+        Pure HTTP — no native SDK libraries needed. Used as fallback
+        when SpeechSynthesizer fails (e.g. Error 2176 / missing libssl).
+        """
+        locale = self.TTS_LOCALE_MAP.get(language, 'en-US')
+        voice = self.TTS_VOICE_MAP.get(locale, 'en-US-JennyNeural')
+
+        url = (f'https://{self.region}.tts.speech.microsoft.com'
+               f'/cognitiveservices/v1')
+
+        headers = {
+            'Ocp-Apim-Subscription-Key': self.speech_key,
+            'Content-Type': 'application/ssml+xml',
+            'X-Microsoft-OutputFormat': 'riff-16khz-16bit-mono-pcm',
+            'User-Agent': 'vavilon-ai-service',
+        }
+
+        safe_text = html.escape(text)
+        ssml = (
+            f"<speak version='1.0' xml:lang='{locale}'>"
+            f"<voice name='{voice}'>{safe_text}</voice>"
+            f"</speak>"
+        )
+
+        resp = requests.post(url, headers=headers,
+                             data=ssml.encode('utf-8'), timeout=15)
+
+        if resp.status_code == 200:
+            self._log('debug', 'rest_tts_ok', language=language,
+                      bytes=len(resp.content))
+            return resp.content  # WAV bytes (RIFF format)
+        else:
+            self._log('error', 'rest_tts_fail', language=language,
+                      status=resp.status_code, body=resp.text[:200])
+            self._metric('errors_total')
+            return None
 
     # ── Broadcast to Node.js ────────────────────────────────────
 
