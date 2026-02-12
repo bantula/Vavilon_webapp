@@ -51,3 +51,5 @@ coverage/
 tmp/
 temp/
 *.tmp
+# Claude local settings
+.claude/
