@@ -84,7 +84,7 @@ Resource group: `vavilon-rg`
 |------|---------|
 | `ai-service/src/app.py` | Flask server with `/start-session`, `/process-audio`, `/end-session` |
 | `ai-service/src/speech_service.py` | `TranslationSession` class — Azure SDK continuous recognition + TTS |
-| `ai-service/Dockerfile` | Python 3.9 slim container (NOTE: still installs ffmpeg, no longer needed) |
+| `ai-service/Dockerfile` | Python 3.9 slim container with Azure Speech SDK system deps |
 | `ai-service/requirements.txt` | flask, flask-cors, azure-cognitiveservices-speech, requests, python-dotenv |
 
 ### Frontend (React + Vite)
@@ -131,8 +131,9 @@ Resource group: `vavilon-rg`
 | Type | Payload | When |
 |------|---------|------|
 | `listener_joined` | `{ sessionId, language }` | Confirmation |
-| `subtitle` | `{ text, language }` | Each translated sentence |
-| `audio` | `{ audioData, language }` (base64 WAV) | Each synthesized audio |
+| `subtitle` | `{ text, language }` | Each translated sentence (translation mode) |
+| `audio` | `{ audioData, language }` (base64 WAV) | Each synthesized audio (translation mode) |
+| `bypass_audio` | `{ audioData }` (base64 WAV-wrapped PCM) | Each raw audio chunk (bypass mode) |
 | `speaker_disconnected` | `{}` | Speaker leaves |
 
 ---
@@ -212,13 +213,46 @@ https://www.vavilonapp.rs
 
 ---
 
+## Same-Language Voice Bypass Mode
+
+When a listener's language matches the speaker's source language, audio is streamed **directly** from the speaker through the Node.js backend to that listener. No Azure, no AI service, no STT/TTS/translation.
+
+### How it works
+```
+Speaker mic → audio_chunk → Node backend
+                              ├── Forward to AI service (always, for translation pipeline)
+                              └── If listener.language == speaker.sourceLanguage.split('-')[0]:
+                                    Wrap PCM in WAV header → send as 'bypass_audio' → Listener
+```
+
+### Implementation details
+- **Backend** (`wsHandler.js`): `handleAudioChunk` calls `broadcastBypassAudio()` alongside `forwardAudioToAI()`
+- **Bypass routing** uses in-memory `connections` Map (no Redis roundtrip) for low latency
+- **WAV wrapping**: `createWavHeader()` prepends a 44-byte RIFF header so the browser's `decodeAudioData` works
+- **Listener** (`ListenerPage.jsx`): `playBypassAudio()` uses `AudioContext.currentTime` scheduling for gapless playback
+- **No changes** to AI service, SpeakerPage, session management, or broadcast route
+- Bypass listeners see "Live audio — same language as speaker" instead of subtitles
+- **Bandwidth**: ~43KB/sec per bypass listener (12 chunks/sec × 3.6KB each)
+
+### Separation
+| | Translation Mode | Bypass Mode |
+|---|---|---|
+| Trigger | listener lang != speaker lang | listener lang == speaker lang |
+| Pipeline | Speaker → Backend → AI → Backend → Listener | Speaker → Backend → Listener |
+| Audio format | WAV from TTS (24kHz) | WAV-wrapped PCM (16kHz) |
+| Message type | `audio` + `subtitle` | `bypass_audio` |
+| Latency | ~2-5s (STT + translate + TTS) | ~100-200ms (network only) |
+| Playback | Queue-based sequential | Time-scheduled gapless |
+
+---
+
 ## Known Issues / TODOs
 
-1. **Dockerfile still installs ffmpeg** — no longer needed since pydub was removed. Can remove the `apt-get install -y ffmpeg` line.
-2. **ScriptProcessorNode is deprecated** — works fine but browsers recommend AudioWorklet. Low priority.
-3. **No authentication** — intentional for MVP. Sessions are public with a 6-char join code.
-4. **In-memory AI sessions** — if the AI container restarts, active translation sessions are lost.
-5. **After rewriting the audio pipeline, all 3 services need redeployment** to test end-to-end.
+1. **ScriptProcessorNode is deprecated** — works fine but browsers recommend AudioWorklet. Low priority.
+2. **No authentication** — intentional for MVP. Sessions are public with a 6-char join code.
+3. **In-memory AI sessions** — if the AI container restarts, active translation sessions are lost.
+4. **Express body limit** set to 5MB (`express.json({ limit: '5mb' })`) to allow TTS audio payloads.
+5. **After code changes, all 3 services need redeployment** to test end-to-end.
 
 ---
 

@@ -26,12 +26,15 @@ function ListenerPage() {
   const [subtitleHistory, setSubtitleHistory] = useState([])
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
+  const [isBypassMode, setIsBypassMode] = useState(false)
 
   const wsRef = useRef(null)
   const audioContextRef = useRef(null)
-  // Queue audio playback so chunks don't overlap
+  // Queue audio playback so chunks don't overlap (translation mode)
   const audioQueueRef = useRef([])
   const isPlayingRef = useRef(false)
+  // Time-scheduled gapless playback (bypass mode)
+  const bypassNextTimeRef = useRef(0)
 
   useEffect(() => {
     return () => cleanup()
@@ -125,6 +128,11 @@ function ListenerPage() {
         queueAudio(payload.audioData)
         break
 
+      case 'bypass_audio':
+        playBypassAudio(payload.audioData)
+        setIsBypassMode(true)
+        break
+
       case 'subtitle':
         setCurrentSubtitle(payload.text)
         setSubtitleHistory(prev => [...prev.slice(-4), payload.text])
@@ -132,6 +140,7 @@ function ListenerPage() {
 
       case 'speaker_disconnected':
         setStatus('Speaker has disconnected')
+        bypassNextTimeRef.current = 0
         break
 
       case 'error':
@@ -206,9 +215,49 @@ function ListenerPage() {
     }
   }
 
+  /**
+   * Bypass mode: play speaker's raw audio with gapless scheduling.
+   * Uses AudioContext.currentTime to schedule each chunk immediately
+   * after the previous one — no gaps, no overlap, lowest latency.
+   */
+  const playBypassAudio = async (audioDataBase64) => {
+    try {
+      const ctx = audioContextRef.current
+      if (!ctx) return
+      if (ctx.state === 'suspended') await ctx.resume()
+
+      // Decode base64 WAV to AudioBuffer
+      const binaryString = atob(audioDataBase64)
+      const bytes = new Uint8Array(binaryString.length)
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i)
+      }
+      const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
+
+      // Schedule gapless: each chunk starts exactly when the previous ends
+      const now = ctx.currentTime
+      if (bypassNextTimeRef.current < now) {
+        bypassNextTimeRef.current = now
+      }
+      // Cap buffer to 2s ahead to prevent unbounded drift
+      if (bypassNextTimeRef.current > now + 2) {
+        bypassNextTimeRef.current = now
+      }
+
+      const source = ctx.createBufferSource()
+      source.buffer = audioBuffer
+      source.connect(ctx.destination)
+      source.start(bypassNextTimeRef.current)
+      bypassNextTimeRef.current += audioBuffer.duration
+    } catch (err) {
+      console.error('Bypass audio error:', err)
+    }
+  }
+
   const handleLeave = () => {
     cleanup()
     setIsJoined(false)
+    setIsBypassMode(false)
     setStatus('')
     setCurrentSubtitle('')
     setSubtitleHistory([])
@@ -217,6 +266,7 @@ function ListenerPage() {
   const cleanup = () => {
     audioQueueRef.current = []
     isPlayingRef.current = false
+    bypassNextTimeRef.current = 0
     if (wsRef.current) {
       wsRef.current.close()
       wsRef.current = null
@@ -240,18 +290,29 @@ function ListenerPage() {
             <div className="error-message">{error}</div>
           )}
 
-          <div className="subtitle-box">
-            {subtitleHistory.length > 1 && (
-              <div style={{ opacity: 0.5, fontSize: '0.9rem', marginBottom: '8px' }}>
-                {subtitleHistory.slice(0, -1).map((text, i) => (
-                  <div key={i} className="subtitle-text">{text}</div>
-                ))}
+          {isBypassMode ? (
+            <div className="subtitle-box">
+              <div className="subtitle-text" style={{ fontSize: '1.3rem' }}>
+                Live audio — same language as speaker
               </div>
-            )}
-            <div className="subtitle-text" style={{ fontSize: '1.3rem' }}>
-              {currentSubtitle || 'Waiting for translation...'}
+              <p style={{ color: '#888', fontSize: '0.85rem', marginTop: '8px' }}>
+                Direct stream, no translation needed
+              </p>
             </div>
-          </div>
+          ) : (
+            <div className="subtitle-box">
+              {subtitleHistory.length > 1 && (
+                <div style={{ opacity: 0.5, fontSize: '0.9rem', marginBottom: '8px' }}>
+                  {subtitleHistory.slice(0, -1).map((text, i) => (
+                    <div key={i} className="subtitle-text">{text}</div>
+                  ))}
+                </div>
+              )}
+              <div className="subtitle-text" style={{ fontSize: '1.3rem' }}>
+                {currentSubtitle || 'Waiting for translation...'}
+              </div>
+            </div>
+          )}
 
           <button
             className="button button-secondary"

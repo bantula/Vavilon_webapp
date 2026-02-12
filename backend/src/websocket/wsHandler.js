@@ -12,7 +12,34 @@ const {
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 
 // Track all WebSocket connections
-const connections = new Map(); // connectionId -> { ws, sessionId, role, language }
+const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage }
+
+/**
+ * Create a WAV (RIFF) header for raw PCM data.
+ * Used by bypass mode to wrap speaker's raw PCM so the browser's
+ * decodeAudioData() can decode it without any changes to the listener.
+ */
+function createWavHeader(dataLength, sampleRate = 16000, bitsPerSample = 16, channels = 1) {
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataLength, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataLength, 40);
+
+  return header;
+}
 
 function setupWebSocket(server) {
   const wss = new WebSocket.Server({ server, path: '/ws' });
@@ -150,10 +177,13 @@ async function handleStartSpeaking(connectionId, payload) {
 
   const { sourceLanguage, targetLanguages } = payload;
 
+  // Store source language for bypass routing
+  conn.sourceLanguage = sourceLanguage || 'en-US';
+
   try {
     await axios.post(`${AI_SERVICE_URL}/start-session`, {
       sessionId: conn.sessionId,
-      sourceLanguage: sourceLanguage || 'en-US',
+      sourceLanguage: conn.sourceLanguage,
       targetLanguages: targetLanguages || ['es', 'fr', 'de']
     }, { timeout: 10000 });
 
@@ -188,13 +218,21 @@ async function handleStopSpeaking(connectionId) {
 }
 
 /**
- * Forward audio chunk (JSON base64) to AI service.
+ * Forward audio chunk (JSON base64) to AI service,
+ * and bypass-stream to same-language listeners.
  */
 async function handleAudioChunk(connectionId, payload) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
 
+  // Forward to AI service for translation (existing flow)
   forwardAudioToAI(conn.sessionId, payload.audioData);
+
+  // Bypass: stream raw audio directly to same-language listeners
+  if (conn.sourceLanguage) {
+    const sourceShort = conn.sourceLanguage.split('-')[0]; // 'en-US' → 'en'
+    broadcastBypassAudio(conn.sessionId, sourceShort, payload.audioData);
+  }
 }
 
 /**
@@ -217,6 +255,42 @@ async function forwardAudioToAI(sessionId, audioData) {
     if (!error.response || error.response.status !== 404) {
       console.error('Error forwarding audio:', error.message);
     }
+  }
+}
+
+/**
+ * Bypass mode: wrap raw PCM in a WAV header and stream directly to
+ * listeners whose selected language matches the speaker's source language.
+ * Uses in-memory connections Map (no Redis roundtrip) for low latency.
+ */
+function broadcastBypassAudio(sessionId, language, pcmBase64) {
+  // Find same-language listeners from in-memory Map (O(n) but fast for <200 conns)
+  const listeners = [];
+  for (const [connId, conn] of connections) {
+    if (conn.sessionId === sessionId &&
+        conn.role === 'listener' &&
+        conn.language === language &&
+        conn.ws.readyState === WebSocket.OPEN) {
+      listeners.push(conn.ws);
+    }
+  }
+
+  if (listeners.length === 0) return;
+
+  // Wrap PCM in WAV header once for all listeners
+  const pcmBuffer = Buffer.from(pcmBase64, 'base64');
+  const wavHeader = createWavHeader(pcmBuffer.length);
+  const wavBuffer = Buffer.concat([wavHeader, pcmBuffer]);
+  const wavBase64 = wavBuffer.toString('base64');
+
+  // Pre-stringify so we don't repeat JSON.stringify per listener
+  const message = JSON.stringify({
+    type: 'bypass_audio',
+    payload: { audioData: wavBase64 }
+  });
+
+  for (const ws of listeners) {
+    ws.send(message);
   }
 }
 
