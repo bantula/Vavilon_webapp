@@ -286,7 +286,7 @@ class TranslationSession:
         # Shutdown TTS thread pool gracefully
         try:
             self._log('info', 'shutting_down_tts_executor')
-            self._tts_executor.shutdown(wait=True, timeout=5.0)
+            self._tts_executor.shutdown(wait=True)
             self._log('info', 'tts_executor_shutdown_complete')
         except Exception as e:
             self._log('error', 'tts_executor_shutdown_fail', error=str(e))
