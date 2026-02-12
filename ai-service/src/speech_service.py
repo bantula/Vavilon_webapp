@@ -358,83 +358,83 @@ class TranslationSession:
             reason_name = str(reason)
 
             if reason == speechsdk.ResultReason.TranslatedSpeech:
-            source_text = evt.result.text
-            if not source_text.strip():
-                return
+                source_text = evt.result.text
+                if not source_text.strip():
+                    return
 
-            self._recognize_count += 1
-            self._metric('stt_calls')
+                self._recognize_count += 1
+                self._metric('stt_calls')
 
-            translations = evt.result.translations
-            translation_keys = list(translations.keys()) if translations else []
+                translations = evt.result.translations
+                translation_keys = list(translations.keys()) if translations else []
 
-            self._log('info', 'stt_recognized',
-                      recognizer_type=type(self._translation_recognizer).__name__,
-                      source_language=self.source_language,
-                      recognized_text=source_text[:100],
-                      reason=reason_name,
-                      translation_keys=translation_keys,
-                      target_languages=list(self.target_languages),
-                      recognize_no=self._recognize_count)
-            self._trace({
-                'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-                'step': 'stt',
-                'text': source_text[:100],
-                'translation_keys': translation_keys,
-                'recognize_no': self._recognize_count
-            })
+                self._log('info', 'stt_recognized',
+                          recognizer_type=type(self._translation_recognizer).__name__,
+                          source_language=self.source_language,
+                          recognized_text=source_text[:100],
+                          reason=reason_name,
+                          translation_keys=translation_keys,
+                          target_languages=list(self.target_languages),
+                          recognize_no=self._recognize_count)
+                self._trace({
+                    'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                    'step': 'stt',
+                    'text': source_text[:100],
+                    'translation_keys': translation_keys,
+                    'recognize_no': self._recognize_count
+                })
 
-            elapsed_ms = int((time.time() - t0) * 1000)
-            self._latency('stt_latencies', elapsed_ms)
+                elapsed_ms = int((time.time() - t0) * 1000)
+                self._latency('stt_latencies', elapsed_ms)
 
-            for lang in self.target_languages:
-                trans_code = self.TRANSLATION_LANG_MAP.get(lang, lang)
+                for lang in self.target_languages:
+                    trans_code = self.TRANSLATION_LANG_MAP.get(lang, lang)
 
-                if trans_code in translations:
-                    translated = translations[trans_code]
-                    self._metric('translate_calls')
+                    if trans_code in translations:
+                        translated = translations[trans_code]
+                        self._metric('translate_calls')
 
-                    self._log('info', 'translated',
-                              language=lang, trans_code=trans_code,
-                              source_text=source_text[:60],
-                              translated_text=translated[:100],
-                              tts_input_text=translated[:60])
-                    self._trace({
-                        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-                        'step': 'translate',
-                        'language': lang,
-                        'text': translated[:100]
-                    })
+                        self._log('info', 'translated',
+                                  language=lang, trans_code=trans_code,
+                                  source_text=source_text[:60],
+                                  translated_text=translated[:100],
+                                  tts_input_text=translated[:60])
+                        self._trace({
+                            'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                            'step': 'translate',
+                            'language': lang,
+                            'text': translated[:100]
+                        })
 
-                    self._translated_text_queues[lang].put(translated)
-                    self._broadcast_subtitle(lang, translated)
-                else:
-                    self._log('error', 'translation_missing',
-                              language=lang,
-                              trans_code=trans_code,
-                              available_keys=translation_keys,
-                              source_text=source_text[:60],
-                              diagnostic=(
-                                  f"Expected key '{trans_code}' not found in "
-                                  f"translations dict. Available: {translation_keys}. "
-                                  f"Verify add_target_language('{trans_code}') was called."))
+                        self._translated_text_queues[lang].put(translated)
+                        self._broadcast_subtitle(lang, translated)
+                    else:
+                        self._log('error', 'translation_missing',
+                                  language=lang,
+                                  trans_code=trans_code,
+                                  available_keys=translation_keys,
+                                  source_text=source_text[:60],
+                                  diagnostic=(
+                                      f"Expected key '{trans_code}' not found in "
+                                      f"translations dict. Available: {translation_keys}. "
+                                      f"Verify add_target_language('{trans_code}') was called."))
 
-        elif reason == speechsdk.ResultReason.RecognizedSpeech:
-            # RecognizedSpeech (not TranslatedSpeech) means Azure recognized
-            # the speech but did NOT translate it. This is a critical diagnostic.
-            self._log('error', 'recognized_but_NOT_translated',
-                      recognized_text=evt.result.text[:100] if evt.result.text else '',
-                      reason=reason_name,
-                      recognizer_type=type(self._translation_recognizer).__name__,
-                      source_language=self.source_language,
-                      target_languages=list(self.target_languages),
-                      diagnostic=(
-                          "ResultReason is RecognizedSpeech, NOT TranslatedSpeech. "
-                          "Azure recognized speech but produced NO translations. "
-                          "Causes: (1) SpeechRecognizer used instead of TranslationRecognizer, "
-                          "(2) add_target_language() not called, "
-                          "(3) language codes in wrong format (use 'es' not 'es-ES')."))
-            self._metric('errors_total')
+            elif reason == speechsdk.ResultReason.RecognizedSpeech:
+                # RecognizedSpeech (not TranslatedSpeech) means Azure recognized
+                # the speech but did NOT translate it. This is a critical diagnostic.
+                self._log('error', 'recognized_but_NOT_translated',
+                          recognized_text=evt.result.text[:100] if evt.result.text else '',
+                          reason=reason_name,
+                          recognizer_type=type(self._translation_recognizer).__name__,
+                          source_language=self.source_language,
+                          target_languages=list(self.target_languages),
+                          diagnostic=(
+                              "ResultReason is RecognizedSpeech, NOT TranslatedSpeech. "
+                              "Azure recognized speech but produced NO translations. "
+                              "Causes: (1) SpeechRecognizer used instead of TranslationRecognizer, "
+                              "(2) add_target_language() not called, "
+                              "(3) language codes in wrong format (use 'es' not 'es-ES')."))
+                self._metric('errors_total')
 
             elif reason == speechsdk.ResultReason.NoMatch:
                 self._log('warn', 'no_match',
