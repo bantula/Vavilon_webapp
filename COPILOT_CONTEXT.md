@@ -99,7 +99,10 @@ Resource group: `vavilon-rg`
 | File | Purpose |
 |------|---------|
 | `DEPLOYMENT.md` | Full Azure deployment guide (all steps) |
-| `dubber.py` | Reference file from hardware version — NOT used at runtime, safe to delete |
+| `debug/send_test_audio.py` | End-to-end pipeline test script — streams audio chunks, checks trace/metrics |
+| `help/dubber.py` | Legacy hardware version code — NOT used in web app, safe to delete |
+| `help/audio_interface.py` | Legacy UDP streaming code — NOT used in web app, safe to delete |
+| `help/auxiliary_functions.py` | Legacy helper functions — NOT used in web app, safe to delete |
 
 ---
 
@@ -246,6 +249,36 @@ Speaker mic → audio_chunk → Node backend
 
 ---
 
+## Debugging & Monitoring (Added Feb 2026)
+
+### Backend Structured Logging
+- **Structured JSON logs** (slog format) in `wsHandler.js`
+- **Trace ID generation** for each session to track requests across services
+- **Sequence numbers** per audio chunk for debugging lost packets
+- **Throttled logging** — logs every 50th chunk to reduce noise
+- **Broadcast logging** — tracks subtitle and audio broadcasts to listeners
+
+### AI Service Debug Endpoints
+- **POST /start-session** — returns `trace_id` for the session
+- **GET /debug/trace/:trace_id** — retrieves ring buffer of last 100 trace events for a session
+- **GET /metrics** — returns session counts, recognition stats, TTS queue depths, error counts
+- **GET /health** — basic health check endpoint
+
+### AI Service Instrumentation
+- **Metrics collection** — tracks active sessions, total recognitions, TTS operations, errors
+- **Trace ring buffer** — keeps last 100 events per session (start, recognizing, recognized, synthesizing, broadcast)
+- **DEBUG mode** — saves raw audio chunks to disk when `DEBUG=true` environment variable is set
+- **Full exception handling** — TTS threads catch all exceptions to prevent silent death
+- **Empty audio detection** — logs warning when synthesizer returns empty audio data
+- **Partial recognition callback** (`_on_recognizing`) — logs streaming recognition for visibility
+
+### Fixed Issues
+- **TTS format changed** to `Riff16Khz16BitMonoPcm` for better compatibility
+- **Cancellation handling** fixed to use `evt.cancellation_details` instead of `evt.result`
+- **Thread error visibility** — TTS synthesis threads now log all exceptions
+
+---
+
 ## Known Issues / TODOs
 
 1. **ScriptProcessorNode is deprecated** — works fine but browsers recommend AudioWorklet. Low priority.
@@ -272,7 +305,8 @@ az webapp deployment source config-zip --resource-group vavilon-rg --name vavilo
 ```powershell
 cd ai-service
 az acr build --registry vavilonacr --image vavilon-ai:latest .
-# Then update/recreate the container instance
+# Restart the container instance to pick up new image
+az container restart --resource-group vavilon-rg --name vavilon-ai
 ```
 
 ### Frontend
