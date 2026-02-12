@@ -372,6 +372,162 @@ class TranslationSession:
 
 ---
 
+### Translation Pipeline Stability & Exception Handling (CRITICAL)
+
+**Problem**: Recognition works for first 1-2 sentences, then stops permanently. English→English bypass mode continues working, but translation pipeline crashes.
+
+**Root Cause**: Unhandled exceptions in Azure SDK event callbacks crash the recognizer, preventing future utterances from being processed.
+
+#### Critical Stability Rule: NO UNHANDLED EXCEPTIONS IN CALLBACKS
+
+ALL Azure SDK event handlers MUST be wrapped in try/except to prevent recognizer crash:
+
+```python
+def _on_recognized(self, evt):
+    try:
+        # Process translation, TTS, broadcast
+        # If ANY exception occurs here, recognizer would die WITHOUT try/except
+        ...
+    except Exception as e:
+        self._log('error', 'recognized_handler_exception',
+                  error=str(e), traceback=traceback.format_exc(),
+                  note='CRITICAL: Exception caught - recognizer continues')
+        # Recognizer continues processing future utterances
+```
+
+**Required Exception Handling**:
+- ✅ `_on_session_started` — wrapped in try/except
+- ✅ `_on_recognizing` — wrapped in try/except
+- ✅ `_on_recognized` — wrapped in try/except (MOST CRITICAL)
+- ✅ `_on_canceled` — wrapped in try/except
+- ✅ `_on_session_stopped` — wrapped in try/except
+
+#### TTS Thread Safety & Bounded Execution
+
+**Problem**: Unbounded thread creation can cause resource exhaustion and crashes after multiple utterances.
+
+**Solution**: Use `ThreadPoolExecutor` with bounded worker pool:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+self._tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f'tts-{session_id}')
+
+# Submit TTS work to bounded pool instead of creating unbounded threads
+for lang in self.target_languages:
+    future = self._tts_executor.submit(self._voice_synth, lang)
+    self._synth_threads[lang]["future"] = future
+```
+
+**Benefits**:
+- Limits concurrent TTS operations to 2 per session
+- Prevents thread explosion when processing multiple utterances
+- Graceful shutdown with `executor.shutdown(wait=True, timeout=5.0)`
+- Better resource management and error isolation
+
+#### TTS Failure Isolation
+
+**Critical Rule**: TTS failure for one language MUST NOT stop recognizer.
+
+```python
+def _voice_synth(self, language):
+    while self._synth_threads[language]["running"]:
+        try:
+            text = self._translated_text_queues[language].get(timeout=0.5)
+            audio_bytes = self._sdk_tts(language, text)
+            self._broadcast_audio(language, audio_bytes)
+        except Exception as e:
+            # TTS failed for this language — log and continue
+            self._log('error', 'tts_exception',
+                      language=language, error=str(e),
+                      note='TTS failed for this language - recognizer continues')
+            # Recognizer processes future utterances normally
+```
+
+**Isolation guarantees**:
+- TTS exception for French doesn't stop Spanish TTS
+- TTS thread death doesn't crash recognizer
+- Broadcast failure doesn't prevent recognition
+- File write errors don't propagate to recognizer
+
+#### Lifecycle State Management
+
+Track lifecycle flags to detect premature crashes:
+
+```python
+self._recognition_started = False  # Set True in start()
+self._recognition_stopped = False  # Set True in stop()
+self._stream_closed = False        # Set True when audio_stream.close()
+```
+
+**Diagnostic checks**:
+```python
+# In push_audio: prevent pushing to closed stream
+if self._stream_closed:
+    self._log('error', 'push_audio_after_close',
+              note='Attempting to push audio after stream closed')
+    return
+
+# In _on_session_stopped: detect unexpected stop
+was_unexpected = (self._recognize_count > 0 and 
+                  not self._stop_event.is_set() and 
+                  not self._recognition_stopped)
+
+if was_unexpected:
+    self._log('warn', 'azure_session_stopped', unexpected=True,
+              note='UNEXPECTED session stop - recognition should be continuous')
+```
+
+#### Common Failure Pattern: "Works Twice, Then Stops"
+
+**Symptoms**:
+- First sentence: translates correctly ✅
+- Second sentence: translates correctly ✅
+- Third sentence: nothing happens ❌
+- English→English bypass: continues working ✅
+- Logs: No recognizer activity after 2nd sentence
+
+**Root Causes**:
+1. **Unhandled exception in `_on_recognized`** after processing 2nd sentence
+   - Fix: Wrap entire callback in try/except
+2. **TTS thread crash** corrupting session state
+   - Fix: ThreadPoolExecutor with exception isolation
+3. **Azure SDK callback exception** terminating recognizer
+   - Fix: Never let exceptions escape callback handlers
+4. **Resource exhaustion** from unbounded thread creation
+   - Fix: Bounded thread pool (max_workers=2)
+
+**Debug Checklist**:
+```bash
+# Check for handler exceptions in logs
+az container logs --name vavilon-ai --resource-group vavilon-rg | grep "handler_exception"
+
+# Check for unexpected session stops
+az container logs --name vavilon-ai --resource-group vavilon-rg | grep "unexpected.*true"
+
+# Check for TTS thread crashes
+az container logs --name vavilon-ai --resource-group vavilon-rg | grep "tts_exception"
+
+# Verify recognition count incrementing
+az container logs --name vavilon-ai --resource-group vavilon-rg | grep "recognize_no"
+```
+
+**Expected behavior after fix**:
+```json
+{"step":"stt_recognized", "recognize_no":1}
+{"step":"tts_done", "language":"es", "bytes":45234}
+{"step":"broadcast_audio", "language":"es", "status":200}
+{"step":"stt_recognized", "recognize_no":2}
+{"step":"tts_done", "language":"es", "bytes":51843}
+{"step":"broadcast_audio", "language":"es", "status":200}
+{"step":"stt_recognized", "recognize_no":3}
+{"step":"tts_done", "language":"es", "bytes":48912}
+{"step":"broadcast_audio", "language":"es", "status":200}
+// Continues indefinitely until stop() called
+```
+
+---
+
 ## Browser Audio Capture (critical)
 
 The speaker page uses **AudioContext + ScriptProcessorNode** (NOT MediaRecorder):

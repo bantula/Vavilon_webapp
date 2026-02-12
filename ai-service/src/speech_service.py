@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import time
 import traceback
@@ -109,12 +110,15 @@ class TranslationSession:
         self._translated_text_queues: Dict[str, queue.Queue] = {}
         self._synthesizers: Dict[str, speechsdk.SpeechSynthesizer] = {}
         self._synth_threads: Dict[str, dict] = {}
+        # Bounded thread pool for TTS: max 2 concurrent per session
+        self._tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f'tts-{session_id}')
 
         self._log('info', 'init',
                   source=source_language,
                   targets=list(self.target_languages),
                   region=region,
-                  target_count=len(self.target_languages))
+                  target_count=len(self.target_languages),
+                  tts_max_workers=2)
 
         self._setup_recognizer()
         self._setup_synthesizers()
@@ -223,17 +227,15 @@ class TranslationSession:
             self._use_rest_tts = True
             self._synthesizers = {}
 
-        # Start TTS worker threads regardless of mode
+        # Start TTS worker threads regardless of mode (managed by executor)
         for lang in self.target_languages:
             self._synth_threads[lang] = {
-                "thread": threading.Thread(
-                    target=self._voice_synth,
-                    args=(lang,),
-                    daemon=True
-                ),
-                "running": True
+                "running": True,
+                "future": None  # Will be set when submitted to executor
             }
-            self._synth_threads[lang]["thread"].start()
+            # Submit to bounded thread pool instead of creating unbounded threads
+            future = self._tts_executor.submit(self._voice_synth, lang)
+            self._synth_threads[lang]["future"] = future
 
     # ── Session lifecycle ───────────────────────────────────────
 
@@ -281,6 +283,14 @@ class TranslationSession:
         for lang, info in self._synth_threads.items():
             info["running"] = False
 
+        # Shutdown TTS thread pool gracefully
+        try:
+            self._log('info', 'shutting_down_tts_executor')
+            self._tts_executor.shutdown(wait=True, timeout=5.0)
+            self._log('info', 'tts_executor_shutdown_complete')
+        except Exception as e:
+            self._log('error', 'tts_executor_shutdown_fail', error=str(e))
+
         if self._translation_recognizer and not self._recognition_stopped:
             try:
                 self._log('info', 'stopping_recognition',
@@ -300,46 +310,54 @@ class TranslationSession:
             except Exception as e:
                 self._log('error', 'close_stream_fail', error=str(e))
 
-        for lang, info in self._synth_threads.items():
-            if info["thread"].is_alive():
-                info["thread"].join(timeout=3.0)
-
         self._log('info', 'stopped', lifecycle_state='stopped')
 
     # ── Recognition callbacks ───────────────────────────────────
 
     def _on_session_started(self, evt):
-        self._log('info', 'azure_session_started',
-                  lifecycle_event='session_started',
-                  recognition_active=self._recognition_started,
-                  note='Azure SDK session started - recognition pipeline active')
-        self._trace({
-            'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-            'step': 'azure_session_started'
-        })
+        try:
+            self._log('info', 'azure_session_started',
+                      lifecycle_event='session_started',
+                      recognition_active=self._recognition_started,
+                      note='Azure SDK session started - recognition pipeline active')
+            self._trace({
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                'step': 'azure_session_started'
+            })
+        except Exception as e:
+            self._log('error', 'session_started_handler_exception',
+                      error=str(e), traceback=traceback.format_exc(),
+                      note='CRITICAL: Exception in _on_session_started handler')
 
     def _on_recognizing(self, evt):
         """Partial/interim recognition — proves audio is reaching Azure."""
-        if evt.result.text:
-            self._partial_count += 1
-            # First 3 partials at info level to confirm Azure is receiving audio
-            if self._partial_count <= 3:
-                self._log('info', 'recognizing_partial',
-                          partial_no=self._partial_count,
-                          text=evt.result.text[:80],
-                          note='Audio IS reaching Azure and being recognized')
-            elif self._partial_count % 20 == 0:
-                self._log('debug', 'recognizing_partial',
-                          partial_no=self._partial_count,
-                          text=evt.result.text[:80])
+        try:
+            if evt.result.text:
+                self._partial_count += 1
+                # First 3 partials at info level to confirm Azure is receiving audio
+                if self._partial_count <= 3:
+                    self._log('info', 'recognizing_partial',
+                              partial_no=self._partial_count,
+                              text=evt.result.text[:80],
+                              note='Audio IS reaching Azure and being recognized')
+                elif self._partial_count % 20 == 0:
+                    self._log('debug', 'recognizing_partial',
+                              partial_no=self._partial_count,
+                              text=evt.result.text[:80])
+        except Exception as e:
+            self._log('error', 'recognizing_handler_exception',
+                      error=str(e), traceback=traceback.format_exc(),
+                      note='CRITICAL: Exception in _on_recognizing handler - continuing')
 
     def _on_recognized(self, evt):
-        t0 = time.time()
+        # CRITICAL: Wrap entire handler in try/except to prevent recognizer crash
+        try:
+            t0 = time.time()
 
-        reason = evt.result.reason
-        reason_name = str(reason)
+            reason = evt.result.reason
+            reason_name = str(reason)
 
-        if reason == speechsdk.ResultReason.TranslatedSpeech:
+            if reason == speechsdk.ResultReason.TranslatedSpeech:
             source_text = evt.result.text
             if not source_text.strip():
                 return
@@ -418,66 +436,90 @@ class TranslationSession:
                           "(3) language codes in wrong format (use 'es' not 'es-ES')."))
             self._metric('errors_total')
 
-        elif reason == speechsdk.ResultReason.NoMatch:
-            self._log('warn', 'no_match',
-                      reason=reason_name,
-                      no_match_reason=str(evt.result.no_match_details.reason)
-                      if hasattr(evt.result, 'no_match_details') else 'unknown')
-        else:
-            self._log('warn', 'recognized_unexpected',
-                      reason=reason_name,
-                      text=evt.result.text[:100] if evt.result.text else '')
+            elif reason == speechsdk.ResultReason.NoMatch:
+                self._log('warn', 'no_match',
+                          reason=reason_name,
+                          no_match_reason=str(evt.result.no_match_details.reason)
+                          if hasattr(evt.result, 'no_match_details') else 'unknown')
+            else:
+                self._log('warn', 'recognized_unexpected',
+                          reason=reason_name,
+                          text=evt.result.text[:100] if evt.result.text else '')
+        
+        except Exception as e:
+            # CRITICAL: Never let exception crash the recognizer
+            self._log('error', 'recognized_handler_exception',
+                      error=str(e),
+                      traceback=traceback.format_exc(),
+                      recognize_count=self._recognize_count,
+                      note='CRITICAL: Exception in _on_recognized handler - recognizer continues')
+            self._metric('errors_total')
 
     def _on_canceled(self, evt):
-        cancellation = evt.cancellation_details
-        self._log('error', 'recognition_canceled',
-                  lifecycle_event='canceled',
-                  reason=str(cancellation.reason),
-                  error_code=str(cancellation.error_code) if hasattr(cancellation, 'error_code') else '',
-                  error_details=cancellation.error_details if cancellation.error_details else '',
-                  recognition_count=self._recognize_count,
-                  note='CRITICAL: Recognition canceled - check error_details for root cause')
-        self._metric('errors_total')
-        self._trace({
-            'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-            'step': 'canceled',
-            'reason': str(cancellation.reason),
-            'details': cancellation.error_details or ''
-        })
+        try:
+            cancellation = evt.cancellation_details
+            self._log('error', 'recognition_canceled',
+                      lifecycle_event='canceled',
+                      reason=str(cancellation.reason),
+                      error_code=str(cancellation.error_code) if hasattr(cancellation, 'error_code') else '',
+                      error_details=cancellation.error_details if cancellation.error_details else '',
+                      recognition_count=self._recognize_count,
+                      note='CRITICAL: Recognition canceled - check error_details for root cause')
+            self._metric('errors_total')
+            self._trace({
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                'step': 'canceled',
+                'reason': str(cancellation.reason),
+                'details': cancellation.error_details or ''
+            })
+        except Exception as e:
+            self._log('error', 'canceled_handler_exception',
+                      error=str(e), traceback=traceback.format_exc(),
+                      note='CRITICAL: Exception in _on_canceled handler')
+            self._metric('errors_total')
 
     def _on_session_stopped(self, evt):
-        # This callback fires when Azure's recognition session ends.
-        # In continuous recognition, this should NOT fire unless:
-        # 1. stop_continuous_recognition() was explicitly called
-        # 2. The audio stream was closed
-        # 3. An error occurred
-        # If this fires unexpectedly (recognize_count > 0 but stop() not called),
-        # it indicates a problem.
-        was_unexpected = (self._recognize_count > 0 and 
-                          not self._stop_event.is_set() and 
-                          not self._recognition_stopped)
-        
-        self._log('warn' if was_unexpected else 'info',
-                  'azure_session_stopped',
-                  lifecycle_event='session_stopped',
-                  recognition_count=self._recognize_count,
-                  stop_called=self._stop_event.is_set(),
-                  recognition_stopped=self._recognition_stopped,
-                  unexpected=was_unexpected,
-                  note=('UNEXPECTED session stop - recognition should be continuous' 
-                        if was_unexpected else 
-                        'Normal session_stopped after explicit stop()'))
+        try:
+            # This callback fires when Azure's recognition session ends.
+            # In continuous recognition, this should NOT fire unless:
+            # 1. stop_continuous_recognition() was explicitly called
+            # 2. The audio stream was closed
+            # 3. An error occurred
+            # If this fires unexpectedly (recognize_count > 0 but stop() not called),
+            # it indicates a problem.
+            was_unexpected = (self._recognize_count > 0 and 
+                              not self._stop_event.is_set() and 
+                              not self._recognition_stopped)
+            
+            self._log('warn' if was_unexpected else 'info',
+                      'azure_session_stopped',
+                      lifecycle_event='session_stopped',
+                      recognition_count=self._recognize_count,
+                      stop_called=self._stop_event.is_set(),
+                      recognition_stopped=self._recognition_stopped,
+                      unexpected=was_unexpected,
+                      note=('UNEXPECTED session stop - recognition should be continuous' 
+                            if was_unexpected else 
+                            'Normal session_stopped after explicit stop()'))
+        except Exception as e:
+            self._log('error', 'session_stopped_handler_exception',
+                      error=str(e), traceback=traceback.format_exc(),
+                      note='CRITICAL: Exception in _on_session_stopped handler')
 
     # ── TTS synthesis thread ────────────────────────────────────
 
     def _voice_synth(self, language):
         """
-        Per-language TTS thread. Pulls translated text from queue,
-        synthesizes audio, broadcasts. Catches ALL exceptions to prevent
-        silent thread death. Supports SDK and REST API modes.
+        Per-language TTS thread (bounded via ThreadPoolExecutor).
+        Pulls translated text from queue, synthesizes audio, broadcasts.
+        Catches ALL exceptions to prevent silent thread death.
+        Supports SDK and REST API modes.
         """
         mode = 'rest' if self._use_rest_tts else 'sdk'
-        self._log('info', 'synth_thread_start', language=language, mode=mode)
+        self._log('info', 'synth_thread_start',
+                  language=language,
+                  mode=mode,
+                  thread_pool='bounded_executor')
 
         while self._synth_threads[language]["running"]:
             try:
@@ -528,9 +570,13 @@ class TranslationSession:
 
             except Exception as e:
                 # CRITICAL: catch all so the thread never dies
-                self._log('error', 'tts_exception', language=language,
-                          mode=mode, error=str(e),
-                          traceback=traceback.format_exc())
+                # TTS failure for one language should NOT stop recognizer
+                self._log('error', 'tts_exception',
+                          language=language,
+                          mode=mode,
+                          error=str(e),
+                          traceback=traceback.format_exc(),
+                          note='TTS failed for this language - recognizer continues for future utterances')
                 self._metric('errors_total')
             finally:
                 try:
