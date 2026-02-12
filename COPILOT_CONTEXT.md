@@ -281,6 +281,44 @@ Speaker mic → audio_chunk → Node backend
 
 ## Current Issues (Feb 12, 2026)
 
+### ⚠️ Azure Speech SDK Error 2176 - IN PROGRESS 
+**Status**: Translation sessions failing to start - Active troubleshooting  
+**Error**: `Failed to initialize platform (azure-c-shared). Error: 2176`
+
+**Problem Summary**:
+- Users see "Failed to start translation session" when clicking "Start Speaking"
+- Backend successfully connects to AI service
+- AI service returning 500 Internal Server Error
+-AI logs show Azure Speech SDK failing to create `SpeechSynthesizer`
+- Error occurs in: `synthesizer_create_speech_synthesizer_from_config`
+
+**Root Cause**:
+Azure Speech SDK error 2176 when creating TTS synthesizers in containerized environment. This is a known Azure SDK initialization issue in Docker containers.
+
+**Tried Solutions**:
+1. ❌ Added comprehensive system dependencies (libssl3, libssl-dev, libgcc-s1, libstdc++6, build-essential)
+2. ❌ Switched from `python:3.9-slim` to full `python:3.9` image
+3. ⏳ Next: Lazy synthesizer initialization (create on-demand vs at session start)
+
+**Error Stack Trace**:
+```azure-cognitiveservices-speech/libMicrosoft.CognitiveServices.Speech.core.so
+Runtime error: Failed to initialize platform (azure-c-shared). Error: 2176
+```
+
+**Impact**:
+- ✅ Frontend CORS: Fixed
+- ✅ Backend deployment: Working
+- ❌ Translation system: Broken - Cannot start sessions
+- ⚠️ Bypass mode (same-language listeners): Should still work
+
+**Next Steps**:
+1. Modify `_setup_synthesizers` to create synthesizers lazily instead of at init
+2. Test with Ubuntu-based container image
+3. Try older Azure Speech SDK version (pre-1.36.0)
+4. Contact Microsoft Azure support if issue persists
+
+---
+
 ### ✅ CORS Configuration Problem - RESOLVED
 **Status**: FIXED - Both production URLs now working  
 **Resolution Date**: Feb 12, 2026 19:35 UTC
