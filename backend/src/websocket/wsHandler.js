@@ -588,6 +588,8 @@ function sendError(connectionId, errorMessage) {
     type: 'error',
     payload: { message: errorMessage }
   });
+}
+
 /**
  * Update active languages for a session and notify Python AI service.
  * Only languages with active listeners will have TTS generated.
@@ -647,7 +649,5 @@ function setsEqual(a, b) {
 module.exports = {
   setupWebSocket,
   broadcastToListeners,
-  updateActiveLanguages: updateSessionActiveLanguage
-  setupWebSocket,
-  broadcastToListeners
+  updateActiveLanguages: updateSessionActiveLanguages
 };
