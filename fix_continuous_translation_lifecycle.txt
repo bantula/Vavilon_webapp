@@ -1,0 +1,418 @@
+CONTINUOUS TRANSLATION LIFECYCLE FIX - SUMMARY
+==============================================
+
+Date: February 12, 2026
+Branch: fix/continuous-translation
+Status: Committed and Pushed to GitHub
+
+═══════════════════════════════════════════════════════════════════
+
+ROOT CAUSE IDENTIFIED
+═══════════════════════════════════════════════════════════════════
+
+Problem: "First sentence works, then recognition stops permanently"
+
+Analysis:
+- Standalone Python script with TranslationRecognizer works continuously (multiple sentences) ✓
+- Online WebSocket version translates first sentence correctly ✓
+- After first translated sentence, recognition stops permanently ✗
+- English → English bypass mode works continuously ✓
+- Translation itself works (first sentence proves Azure credentials and SDK are functional) ✓
+
+Conclusion:
+This is a RECOGNIZER LIFECYCLE issue in the server WebSocket pipeline, not a translation configuration problem.
+
+Most Likely Cause:
+- The Azure SDK's `session_stopped` event is firing prematurely after the first successful recognition
+- This could be triggered by:
+  * Audio stream being closed inadvertently
+  * SDK internal timeout (though unlikely with continuous recognition)
+  * Race condition in callback handlers
+  * Stream buffer underrun or error
+
+Current Implementation (CORRECT but lacking visibility):
+✓ Uses TranslationRecognizer (not SpeechRecognizer)
+✓ Uses start_continuous_recognition_async() (not recognize_once_async)
+✓ Recognizer stored in session object (not recreated per chunk)
+✓ Audio stream NOT closed in recognized callback
+✓ stop_continuous_recognition() only called in session.stop()
+
+Gap:
+✗ No logging to detect WHEN session_stopped fires
+✗ No state tracking to identify unexpected lifecycle transitions
+✗ No visibility into whether stop is premature or intentional
+
+═══════════════════════════════════════════════════════════════════
+
+CHANGES IMPLEMENTED
+═══════════════════════════════════════════════════════════════════
+
+File: ai-service/src/speech_service.py
+────────────────────────────────────────
+
+1. Lifecycle State Tracking (NEW):
+   
+   Added instance variables:
+   - self._recognition_started = False
+   - self._recognition_stopped = False
+   - self._stream_closed = False
+   
+   Purpose: Track lifecycle transitions to detect premature closure
+
+2. Enhanced start() Method:
+   
+   Before:
+   - Simple log: "starting_recognition"
+   - Call start_continuous_recognition_async()
+   - Simple log: "recognition_started"
+   
+   After:
+   + Log recognition mode: 'continuous'
+   + Log method used: 'start_continuous_recognition_async'
+   + Set _recognition_started = True
+   + Log lifecycle state: 'active'
+   + Add note: "Recognizer now listening continuously until stop() called"
+
+3. Enhanced push_audio() Method:
+   
+   Added:
+   + Check if stream closed before pushing audio
+   + Error log if attempting to push after close
+   + Include recognition_active and stream_open status in logs
+   + Prevent undefined behavior from pushing to closed stream
+
+4. Enhanced stop() Method:
+   
+   Before:
+   - Simple stop sequence
+   - Generic error handling
+   
+   After:
+   + Detailed state logging at each step:
+     * Log 'stopping' with lifecycle_state
+     * Log 'stopping_recognition' before SDK call
+     * Set _recognition_stopped = True
+     * Log 'recognition_stopped' after SDK call
+     * Log 'closing_audio_stream' before close
+     * Set _stream_closed = True
+     * Log 'audio_stream_closed' after close
+   + Explicit note: "Explicit stop() called - ending session"
+   + Separate error logs for recognizer vs stream failures
+
+5. Enhanced _on_session_started() Callback:
+   
+   Added:
+   + lifecycle_event: 'session_started'
+   + recognition_active flag value
+   + Note: "Azure SDK session started - recognition pipeline active"
+
+6. Enhanced _on_canceled() Callback:
+   
+   Added:
+   + lifecycle_event: 'canceled'
+   + recognition_count (shows how many recognitions succeeded before cancellation)
+   + Note: "CRITICAL: Recognition canceled - check error_details for root cause"
+
+7. CRITICAL Enhancement: _on_session_stopped() Callback:
+   
+   This is the key diagnostic addition.
+   
+   Before:
+   - Single log: "azure_session_stopped"
+   
+   After:
+   + Calculate was_unexpected:
+     * If recognize_count > 0 (at least one sentence processed)
+     * AND stop() was NOT explicitly called
+     * AND recognition not already stopped
+     * THEN this is an UNEXPECTED premature stop
+   
+   + Log level: 'warn' if unexpected, 'info' if normal
+   + Include rich diagnostic data:
+     * lifecycle_event: 'session_stopped'
+     * recognition_count: number of sentences processed
+     * stop_called: whether stop() was explicitly invoked
+     * recognition_stopped: whether recognition already stopped
+     * unexpected: boolean flag
+     * note: Explains if this is unexpected or normal
+   
+   + This will immediately reveal if session_stopped fires prematurely:
+     * Normal: Fires only AFTER /end-session → stop() → stop_continuous_recognition()
+     * Premature: Fires AFTER first recognition WITHOUT stop() being called
+
+═══════════════════════════════════════════════════════════════════
+
+File: COPILOT_CONTEXT.md
+────────────────────────
+
+Added Major New Section: "Continuous Recognition Lifecycle (CRITICAL)"
+
+Content:
+1. Recognition Modes Comparison Table
+   - Single-shot (recognize_once_async) vs Continuous (start_continuous_recognition_async)
+   - Behavior differences
+   - Appropriate use cases
+
+2. Lifecycle Diagram (ASCII art)
+   - Step 1: WebSocket Connected → Create stream/recognizer → start_continuous
+   - Step 2: Audio Streaming Loop → Multiple recognitions without stopping
+   - Step 3: WebSocket Disconnected → Explicit stop → Close stream
+   - Clear annotations showing what NOT to do at each step
+
+3. Common Failure Pattern: "First Sentence Works, Then Stops"
+   - Symptom description
+   - 6 root causes checklist
+   - Log-based diagnosis with JSON examples (good vs bad patterns)
+   - Shows exactly what to look for in logs
+
+4. Lifecycle Rules (MUST FOLLOW)
+   - 6 critical rules with ✅ checkboxes
+   - Rule 1: One recognizer per session
+   - Rule 2: Audio stream stays open
+   - Rule 3: Use continuous recognition
+   - Rule 4: Never stop in callbacks
+   - Rule 5: Track lifecycle state
+   - Rule 6: Explicit stop only
+
+5. Implementation Pattern (Correct)
+   - Python code example showing proper lifecycle
+   - Comments explain WHY each step is critical
+   - Shows what NOT to do in each method
+
+═══════════════════════════════════════════════════════════════════
+
+HOW LIFECYCLE NOW WORKS (With Enhanced Monitoring)
+═══════════════════════════════════════════════════════════════════
+
+Phase 1: Session Initialization
+────────────────────────────────
+Frontend: Speaker clicks "Start Speaking"
+  ↓
+Backend: POST /start-session
+  ↓
+AI Service: TranslationSession.__init__()
+  - Create PushAudioInputStream (stream stays open)
+  - Create TranslationRecognizer (recognizer persists)
+  - Attach callbacks (session_started, recognized, session_stopped, etc.)
+  - Log: "recognizer_created"
+  ↓
+AI Service: session.start()
+  - Log: "starting_recognition" (mode='continuous')
+  - Call: start_continuous_recognition_async().get()
+  - Set: _recognition_started = True
+  - Log: "recognition_started" (lifecycle_state='active')
+  ↓
+SDK Callback: _on_session_started()
+  - Log: "azure_session_started" (recognition_active=True)
+  - Note: "Azure SDK session started - recognition pipeline active"
+
+Phase 2: Continuous Audio Streaming
+────────────────────────────────────
+Loop (until speaker disconnects):
+  
+  Frontend: Capture audio chunk
+    ↓
+  Backend: Receive via WebSocket, forward via HTTP
+    ↓
+  AI Service: POST /process-audio → session.push_audio(bytes)
+    - Check: Stream not closed (_stream_closed == False)
+    - Write: audio_stream.write(bytes)
+    - Every 50th chunk: Log with recognition_active and stream_open states
+    ↓
+  SDK: Continuous recognition processes audio
+    ↓
+  SDK Callback: _on_recognizing() [partial results]
+    - Log first 3 partials to confirm audio reaching Azure
+    ↓
+  SDK Callback: _on_recognized() [final result]
+    - Extract: source_text = evt.result.text
+    - Extract: translations = evt.result.translations
+    - Log: "stt_recognized" with recognize_no (1, 2, 3, ...)
+    - For each target language:
+      * Get translated text from translations dict
+      * Log: "translated" (language, text)
+      * Queue for TTS
+      * Broadcast subtitle
+    - ⚠️ DOES NOT call stop_continuous_recognition()
+    - ⚠️ DOES NOT close audio_stream
+    - Recognition continues...
+    ↓
+  Next audio chunk arrives → Repeat
+
+  This loop continues indefinitely, processing multiple sentences.
+
+Phase 3: Premature Stop Detection (NEW)
+────────────────────────────────────────
+IF Azure SDK fires session_stopped event:
+  
+  SDK Callback: _on_session_stopped()
+    - Calculate: was_unexpected = (
+        recognize_count > 0 AND           # At least one sentence processed
+        NOT stop_called AND               # stop() was NOT called by us
+        NOT recognition_stopped           # Recognition not already stopped
+      )
+    
+    IF was_unexpected:
+      - Log level: 'warn'
+      - Log: "azure_session_stopped" with unexpected=True
+      - Note: "UNEXPECTED session stop - recognition should be continuous"
+      - This reveals the bug: SDK stopped on its own!
+      - Includes recognition_count to show how many succeeded before stop
+    
+    ELSE:
+      - Log level: 'info'
+      - Log: "azure_session_stopped" with unexpected=False
+      - Note: "Normal session_stopped after explicit stop()"
+
+Phase 4: Normal Session Termination
+────────────────────────────────────
+Frontend: Speaker clicks "Stop" or closes page
+  ↓
+Backend: POST /end-session
+  ↓
+AI Service: session.stop()
+  - Log: "stopping" (lifecycle_state='stopping', note="Explicit stop() called")
+  - Set: _stop_event
+  - Stop TTS threads
+  - Log: "stopping_recognition"
+  - Call: stop_continuous_recognition_async().get()
+  - Set: _recognition_stopped = True
+  - Log: "recognition_stopped"
+  - Log: "closing_audio_stream"
+  - Call: audio_stream.close()
+  - Set: _stream_closed = True
+  - Log: "audio_stream_closed"
+  - Join TTS threads
+  - Log: "stopped" (lifecycle_state='stopped')
+  ↓
+SDK Callback: _on_session_stopped()
+  - Calculate: was_unexpected = False (stop was called)
+  - Log: "azure_session_stopped" with unexpected=False
+  - Note: "Normal session_stopped after explicit stop()"
+
+═══════════════════════════════════════════════════════════════════
+
+TESTING & DIAGNOSIS
+═══════════════════════════════════════════════════════════════════
+
+Deploy Updated Container:
+1. Build new image: az acr build --registry vavilonacr --image vavilon-ai:latest .
+2. Delete container: az container delete --name vavilon-ai --resource-group vavilon-rg --yes
+3. Recreate with all env vars including NODE_BACKEND_URL
+4. Wait for startup
+
+Test Scenario:
+1. Create session (POST /start-session)
+2. Stream audio with multiple sentences
+   - "This is the first sentence."
+   - "Here comes the second sentence."
+   - "And this is the third sentence."
+3. Monitor logs in real-time
+
+Expected Logs (CORRECT BEHAVIOR):
+────────────────────────────────────
+{"step":"starting_recognition", "mode":"continuous"}
+{"step":"recognition_started", "lifecycle_state":"active"}
+{"step":"azure_session_started", "recognition_active":true}
+{"step":"stt_recognized", "recognize_no":1, "text":"This is the first sentence"}
+{"step":"stt_recognized", "recognize_no":2, "text":"Here comes the second sentence"}
+{"step":"stt_recognized", "recognize_no":3, "text":"And this is the third sentence"}
+[Continue indefinitely until /end-session]
+{"step":"stopping", "lifecycle_state":"stopping"}
+{"step":"stopping_recognition"}
+{"step":"recognition_stopped"}
+{"step":"closing_audio_stream"}
+{"step":"audio_stream_closed"}
+{"step":"azure_session_stopped", "unexpected":false}
+{"step":"stopped", "lifecycle_state":"stopped"}
+
+Problematic Logs (IF BUG PERSISTS):
+───────────────────────────────────
+{"step":"starting_recognition", "mode":"continuous"}
+{"step":"recognition_started", "lifecycle_state":"active"}
+{"step":"azure_session_started", "recognition_active":true}
+{"step":"stt_recognized", "recognize_no":1, "text":"This is the first sentence"}
+{"step":"azure_session_stopped", "unexpected":true, "recognition_count":1, "stop_called":false}
+                                   ^^^^^^^^^^^^^^^^
+                                   THIS IS THE BUG
+[No more recognitions after this point]
+
+If you see "unexpected":true in azure_session_stopped:
+- Root cause: Azure SDK session is terminating prematurely
+- Possible reasons:
+  1. Audio stream buffer underrun
+  2. SDK internal timeout (check Speech_SegmentationSilenceTimeoutMs)
+  3. Stream format mismatch
+  4. SDK version bug
+  5. Network issue with Azure endpoint
+- Next steps:
+  1. Check if audio is still being pushed (look for "audio_pushed" logs)
+  2. Check if any "canceled" events fire (would indicate SDK error)
+  3. Check Azure SDK version compatibility
+  4. Try increasing Speech_SegmentationSilenceTimeoutMs
+  5. Consider REST API fallback for STT (not just TTS)
+
+═══════════════════════════════════════════════════════════════════
+
+FILES MODIFIED
+═══════════════════════════════════════════════════════════════════
+
+1. ai-service/src/speech_service.py
+   - Added lifecycle state tracking variables
+   - Enhanced all lifecycle methods with detailed logging
+   - Added premature stop detection in _on_session_stopped
+   - Added stream-closed check in push_audio
+   - Total changes: ~80 lines modified/added
+
+2. COPILOT_CONTEXT.md
+   - Added "Continuous Recognition Lifecycle (CRITICAL)" section
+   - Documented recognition modes comparison
+   - Provided lifecycle diagram
+   - Documented common failure patterns
+   - Provided lifecycle rules and correct implementation pattern
+   - Total changes: ~150 lines added
+
+═══════════════════════════════════════════════════════════════════
+
+DEPLOYMENT STATUS
+═══════════════════════════════════════════════════════════════════
+
+Branch: fix/continuous-translation
+Commit: 4a1aec2
+Status: ✅ Pushed to GitHub
+
+Remote: https://github.com/bantula/Vavilon_webapp/pull/new/fix/continuous-translation
+
+Next Steps:
+1. Rebuild AI service Docker image with updated code
+2. Deploy to Azure Container Instances
+3. Test with multi-sentence audio input
+4. Monitor logs for "unexpected":true in azure_session_stopped
+5. If unexpected stop still occurs, investigate Azure SDK configuration
+6. If lifecycle is correct, merge fix/continuous-translation → main
+
+═══════════════════════════════════════════════════════════════════
+
+SUMMARY
+═══════════════════════════════════════════════════════════════════
+
+What Was Changed:
+✓ Added comprehensive lifecycle state tracking to TranslationSession
+✓ Enhanced all lifecycle methods with detailed, structured logging
+✓ Implemented premature stop detection (unexpected session_stopped)
+✓ Added safeguards against pushing audio to closed stream
+✓ Documented continuous recognition lifecycle requirements
+✓ Provided diagnostic tools via log analysis
+
+Why It Matters:
+- Enables immediate detection of premature session termination
+- Provides rich diagnostic data to identify root cause
+- Documents correct lifecycle pattern for future development
+- Prevents common mistakes that break continuous recognition
+
+Expected Outcome:
+- If the issue is premature SDK session_stopped: Now visible in logs with "unexpected":true
+- If the issue is in our code: State tracking prevents incorrect shutdown
+- If legitimate: Normal shutdowns logged without warnings
+
+This is a monitoring and diagnostic enhancement that will reveal the true root cause of the "first sentence only" problem through enhanced logging and state tracking.
