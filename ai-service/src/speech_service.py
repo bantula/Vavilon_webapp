@@ -5,11 +5,12 @@ import json
 import os
 import queue
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import time
 import traceback
-from typing import Dict, Callable, Optional
+from typing import Dict, Callable, Optional, Set
 
 
 def _slog(level, step, **kwargs):
@@ -85,6 +86,10 @@ class TranslationSession:
         self._recognition_started = False
         self._recognition_stopped = False
         self._stream_closed = False
+        
+        # Track active listener languages for TTS
+        self._active_languages: Set[str] = set(target_languages)  # Start with all, Node will update
+        self._active_languages_lock = threading.Lock()
 
         # ── Validate inputs (fail loudly) ────────────────────────
         if not self.speech_key:
@@ -397,9 +402,10 @@ class TranslationSession:
 
                 self._recognize_count += 1
                 self._metric('stt_calls')
+                segment_id = str(uuid.uuid4())
 
-                translations = evt.result.translations
-                translation_keys = list(translations.keys()) if translations else []
+                translations_dict = evt.result.translations
+                translation_keys = list(translations_dict.keys()) if translations_dict else []
 
                 self._log('info', 'stt_recognized',
                           recognizer_type=type(self._translation_recognizer).__name__,
@@ -408,49 +414,72 @@ class TranslationSession:
                           reason=reason_name,
                           translation_keys=translation_keys,
                           target_languages=list(self.target_languages),
-                          recognize_no=self._recognize_count)
+                          recognize_no=self._recognize_count,
+                          segment_id=segment_id)
                 self._trace({
                     'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                     'step': 'stt',
                     'text': source_text[:100],
                     'translation_keys': translation_keys,
-                    'recognize_no': self._recognize_count
+                    'recognize_no': self._recognize_count,
+                    'segment_id': segment_id
                 })
 
                 elapsed_ms = int((time.time() - t0) * 1000)
                 self._latency('stt_latencies', elapsed_ms)
 
+                # Build translations map with short language codes
+                translations = {}
                 for lang in self.target_languages:
                     trans_code = self.TRANSLATION_LANG_MAP.get(lang, lang)
 
-                    if trans_code in translations:
-                        translated = translations[trans_code]
+                    if trans_code in translations_dict:
+                        translated = translations_dict[trans_code]
+                        translations[lang] = translated
                         self._metric('translate_calls')
 
                         self._log('info', 'translated',
                                   language=lang, trans_code=trans_code,
                                   source_text=source_text[:60],
                                   translated_text=translated[:100],
-                                  tts_input_text=translated[:60])
+                                  segment_id=segment_id)
                         self._trace({
                             'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                             'step': 'translate',
                             'language': lang,
-                            'text': translated[:100]
+                            'text': translated[:100],
+                            'segment_id': segment_id
                         })
-
-                        self._translated_text_queues[lang].put(translated)
-                        self._broadcast_subtitle(lang, translated)
                     else:
                         self._log('error', 'translation_missing',
                                   language=lang,
                                   trans_code=trans_code,
                                   available_keys=translation_keys,
                                   source_text=source_text[:60],
+                                  segment_id=segment_id,
                                   diagnostic=(
                                       f"Expected key '{trans_code}' not found in "
                                       f"translations dict. Available: {translation_keys}. "
                                       f"Verify add_target_language('{trans_code}') was called."))
+
+                # Emit segment_finalized event immediately (don't wait for TTS)
+                self._emit_segment_finalized(
+                    segment_id=segment_id,
+                    source_text=source_text,
+                    translations=translations
+                )
+
+                # Queue TTS jobs only for active languages
+                with self._active_languages_lock:
+                    active_langs = self._active_languages.copy()
+                
+                for lang in active_langs:
+                    if lang in translations:
+                        # Queue with segment_id for tts_ready correlation
+                        self._translated_text_queues[lang].put({
+                            'segment_id': segment_id,
+                            'text': translations[lang]
+                        })
 
             elif reason == speechsdk.ResultReason.RecognizedSpeech:
                 # RecognizedSpeech (not TranslatedSpeech) means Azure recognized
@@ -544,7 +573,7 @@ class TranslationSession:
     def _voice_synth(self, language):
         """
         Per-language TTS thread (bounded via ThreadPoolExecutor).
-        Pulls translated text from queue, synthesizes audio, broadcasts.
+        Pulls translated text from queue, synthesizes audio, emits tts_ready.
         Catches ALL exceptions to prevent silent thread death.
         Supports SDK and REST API modes.
         """
@@ -557,12 +586,21 @@ class TranslationSession:
         while self._synth_threads[language]["running"] and not self._stop_event.is_set():
             try:
                 # Reduced timeout for faster exit on stop
-                text = self._translated_text_queues[language].get(timeout=0.2)
+                item = self._translated_text_queues[language].get(timeout=0.2)
             except queue.Empty:
                 # Check stop_event more frequently
                 if self._stop_event.is_set():
                     break
                 continue
+
+            # Extract segment_id and text from queue item
+            if isinstance(item, dict):
+                segment_id = item.get('segment_id', 'unknown')
+                text = item.get('text', '')
+            else:
+                # Fallback for backward compatibility
+                segment_id = 'legacy'
+                text = item
 
             t0 = time.time()
             try:
@@ -571,6 +609,7 @@ class TranslationSession:
                 self._log('info', 'tts_start', language=language,
                           mode=mode, tts_input_text=text[:60],
                           tts_locale=locale,
+                          segment_id=segment_id,
                           note='Synthesizing TRANSLATED text (not English original)')
 
                 if self._use_rest_tts:
@@ -583,27 +622,35 @@ class TranslationSession:
 
                 if not audio_bytes or len(audio_bytes) == 0:
                     self._log('error', 'tts_empty', language=language,
-                              mode=mode, text=text[:60], elapsed_ms=elapsed_ms)
+                              mode=mode, text=text[:60], elapsed_ms=elapsed_ms,
+                              segment_id=segment_id)
                     self._metric('errors_total')
                     continue
 
                 self._log('info', 'tts_done', language=language,
                           mode=mode, bytes=len(audio_bytes),
-                          elapsed_ms=elapsed_ms)
+                          elapsed_ms=elapsed_ms, segment_id=segment_id)
                 self._trace({
                     'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                     'step': 'tts',
                     'language': language,
                     'mode': mode,
                     'bytes': len(audio_bytes),
-                    'elapsed_ms': elapsed_ms
+                    'elapsed_ms': elapsed_ms,
+                    'segment_id': segment_id
                 })
 
                 if self.debug:
                     self._save_tts_debug(language, audio_bytes)
 
                 audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                self._broadcast_audio(language, audio_b64)
+                
+                # Emit tts_ready event instead of direct broadcast
+                self._emit_tts_ready(
+                    segment_id=segment_id,
+                    language=language,
+                    audio_b64=audio_b64
+                )
 
             except Exception as e:
                 # CRITICAL: catch all so the thread never dies
@@ -687,60 +734,101 @@ class TranslationSession:
             self._metric('errors_total')
             return None
 
-    # ── Broadcast to Node.js ────────────────────────────────────
+    # ── Event emission to Node.js ──────────────────────────────
 
-    def _broadcast_subtitle(self, language, text):
+    def _emit_segment_finalized(self, segment_id: str, source_text: str, translations: dict):
+        """
+        Emit segment_finalized event when Azure recognizes a complete utterance.
+        Node will immediately broadcast subtitles to all listeners.
+        """
         try:
+            event = {
+                'type': 'segment_finalized',
+                'traceId': self.trace_id,
+                'sessionId': self.session_id,
+                'segmentId': segment_id,
+                'sourceLanguage': self.source_language,
+                'recognizedText': source_text,
+                'translations': translations,  # {'es': 'Hola', 'fr': 'Bonjour', ...}
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S%z')
+            }
+            
             resp = requests.post(
-                f'{self.node_backend_url}/api/broadcast',
-                json={
-                    'sessionId': self.session_id,
-                    'language': language,
-                    'subtitleText': text
-                },
+                f'{self.node_backend_url}/api/events',
+                json=event,
                 timeout=5
             )
+            
             if resp.status_code != 200:
-                self._log('warn', 'broadcast_subtitle_fail',
-                          language=language, status=resp.status_code,
+                self._log('warn', 'segment_finalized_fail',
+                          segment_id=segment_id, status=resp.status_code,
                           body=resp.text[:200])
+            else:
+                self._log('info', 'segment_finalized_sent',
+                          segment_id=segment_id,
+                          translation_count=len(translations))
         except Exception as e:
-            self._log('error', 'broadcast_subtitle_error',
-                      language=language, error=str(e))
+            self._log('error', 'segment_finalized_error',
+                      segment_id=segment_id, error=str(e))
 
-    def _broadcast_audio(self, language, audio_b64):
+    def _emit_tts_ready(self, segment_id: str, language: str, audio_b64: str):
+        """
+        Emit tts_ready event when TTS synthesis completes.
+        Node will broadcast audio to listeners of that language.
+        """
         try:
+            event = {
+                'type': 'tts_ready',
+                'traceId': self.trace_id,
+                'sessionId': self.session_id,
+                'segmentId': segment_id,
+                'language': language,
+                'audioFormat': 'riff16khz16bitpcm',
+                'audioBytesBase64': audio_b64
+            }
+            
             resp = requests.post(
-                f'{self.node_backend_url}/api/broadcast',
-                json={
-                    'sessionId': self.session_id,
-                    'language': language,
-                    'audioData': audio_b64
-                },
+                f'{self.node_backend_url}/api/events',
+                json=event,
                 timeout=10
             )
-            self._log('info', 'broadcast_audio',
+            
+            self._log('info', 'tts_ready_sent',
+                      segment_id=segment_id,
                       language=language,
                       status=resp.status_code,
                       b64_len=len(audio_b64))
             self._trace({
                 'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-                'step': 'broadcast_audio',
+                'step': 'tts_ready',
+                'segment_id': segment_id,
                 'language': language,
                 'status': resp.status_code,
                 'b64_len': len(audio_b64)
             })
 
             if resp.status_code != 200:
-                self._log('error', 'broadcast_audio_rejected',
+                self._log('error', 'tts_ready_rejected',
+                          segment_id=segment_id,
                           language=language, status=resp.status_code,
                           body=resp.text[:300])
                 self._metric('errors_total')
 
         except Exception as e:
-            self._log('error', 'broadcast_audio_error',
+            self._log('error', 'tts_ready_error',
+                      segment_id=segment_id,
                       language=language, error=str(e))
             self._metric('errors_total')
+    
+    def update_active_languages(self, active_languages: Set[str]):
+        """
+        Update the set of languages that have active listeners.
+        Only these languages will have TTS generated.
+        """
+        with self._active_languages_lock:
+            self._active_languages = active_languages
+            self._log('info', 'active_languages_updated',
+                      active_languages=list(active_languages))
 
     # ── Debug file saves ────────────────────────────────────────
 

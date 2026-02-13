@@ -18,6 +18,10 @@ const connections = new Map(); // connectionId -> { ws, sessionId, role, languag
 // sessionId -> { consecutiveErrors: number, degraded: boolean, lastErrorStatus: number|null }
 const sessionHealth = new Map();
 
+// Track active languages per session for TTS optimization
+// sessionId -> Set<language>
+const sessionActiveLanguages = new Map();
+
 // Structured log helper
 function slog(level, component, step, fields = {}) {
   const entry = {
@@ -184,6 +188,9 @@ async function handleListenerJoin(connectionId, payload) {
   conn.language = language;
 
   await addListener(session.id, connectionId, language);
+
+  // Update active languages and notify Python
+  updateSessionActiveLanguages(session.id);
 
   sendMessage(connectionId, {
     type: 'listener_joined',
@@ -559,6 +566,8 @@ async function handleDisconnect(connectionId) {
   if (!conn) return;
 
   if (conn.role === 'speaker') {
+    // Update active languages when listener disconnects
+    updateSessionActiveLanguages(conn.sessionId);
     await handleSpeakerDisconnect(connectionId);
   } else if (conn.role === 'listener') {
     await removeListener(conn.sessionId, connectionId, conn.language);
@@ -579,9 +588,66 @@ function sendError(connectionId, errorMessage) {
     type: 'error',
     payload: { message: errorMessage }
   });
+/**
+ * Update active languages for a session and notify Python AI service.
+ * Only languages with active listeners will have TTS generated.
+ */
+function updateSessionActiveLanguages(sessionId) {
+  // Count listeners per language
+  const languageCounts = {};
+  for (const [connId, conn] of connections) {
+    if (conn.sessionId === sessionId && conn.role === 'listener' && conn.language) {
+      languageCounts[conn.language] = (languageCounts[conn.language] || 0) + 1;
+    }
+  }
+
+  // Languages with at least one listener
+  const activeLanguages = Object.keys(languageCounts).filter(lang => languageCounts[lang] > 0);
+  const prevActive = sessionActiveLanguages.get(sessionId) || new Set();
+  const newActive = new Set(activeLanguages);
+
+  // Only update if changed
+  if (!setsEqual(prevActive, newActive)) {
+    sessionActiveLanguages.set(sessionId, newActive);
+
+    slog('info', 'node', 'active_languages_changed', {
+      sessionId,
+      activeLanguages,
+      languageCounts
+    });
+
+    // Notify Python (fire-and-forget to avoid blocking)
+    axios.post(`${AI_SERVICE_URL}/update-active-languages`, {
+      sessionId,
+      activeLanguages
+    }, { timeout: 5000 })
+      .then(() => {
+        slog('info', 'node', 'active_languages_sent', { sessionId, activeLanguages });
+      })
+      .catch((error) => {
+        slog('warn', 'node', 'active_languages_send_fail', {
+          sessionId,
+          error: error.message
+        });
+      });
+  }
+}
+
+/**
+ * Helper to compare two sets for equality.
+ */
+function setsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const item of a) {
+    if (!b.has(item)) return false;
+  }
+  return true;
 }
 
 module.exports = {
+  setupWebSocket,
+  broadcastToListeners,
+  updateActiveLanguages: updateSessionActiveLanguage
   setupWebSocket,
   broadcastToListeners
 };

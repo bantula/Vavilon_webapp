@@ -203,6 +203,38 @@ def process_audio():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/update-active-languages', methods=['POST'])
+def update_active_languages():
+    """
+    Node notifies Python of which languages have active listeners.
+    Python will only generate TTS for these languages.
+    """
+    try:
+        data = request.json
+        session_id = data.get('sessionId')
+        active_languages = data.get('activeLanguages', [])
+
+        if not session_id:
+            return jsonify({'error': 'Missing sessionId'}), 400
+
+        session = sessions.get(session_id)
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+
+        session.update_active_languages(set(active_languages))
+        
+        slog('info', 'active_languages_updated', 
+             session_id=session_id, 
+             active_languages=active_languages)
+
+        return jsonify({'success': True, 'activeLanguages': active_languages})
+
+    except Exception as e:
+        inc_metric('errors_total')
+        slog('error', 'update_active_languages_fail', error=str(e))
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/end-session', methods=['POST'])
 def end_session():
     try:
