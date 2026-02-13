@@ -233,6 +233,22 @@ def get_trace(trace_id):
     return jsonify({'traceId': trace_id, 'count': len(logs), 'logs': logs[-n:]})
 
 
+@app.route('/routes', methods=['GET'])
+def list_routes():
+    """List all registered routes for quick verification."""
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            'endpoint': rule.endpoint,
+            'methods': sorted(list(rule.methods - {'OPTIONS', 'HEAD'})),
+            'path': str(rule)
+        })
+    return jsonify({
+        'service': 'vavilon-ai-service',
+        'routes': sorted(routes, key=lambda r: r['path'])
+    })
+
+
 @app.route('/metrics', methods=['GET'])
 def get_metrics():
     with _metrics_lock:

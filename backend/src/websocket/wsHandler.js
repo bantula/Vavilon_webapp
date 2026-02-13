@@ -14,6 +14,10 @@ const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 // Track all WebSocket connections
 const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage, traceId, seqNo }
 
+// Track session health for degradation detection
+// sessionId -> { consecutiveErrors: number, degraded: boolean, lastErrorStatus: number|null }
+const sessionHealth = new Map();
+
 // Structured log helper
 function slog(level, component, step, fields = {}) {
   const entry = {
@@ -121,7 +125,17 @@ async function handleMessage(connectionId, data) {
 function handleBinaryMessage(connectionId, buffer) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
-  forwardAudioToAI(conn.sessionId, buffer, conn);
+
+  // Binary messages bypass the JSON protocol — log for visibility
+  slog('warn', 'node', 'binary_audio_received', {
+    connectionId,
+    sessionId: conn.sessionId,
+    traceId: conn.traceId,
+    bytes: buffer.length,
+    note: 'Received raw binary instead of JSON audio_chunk — converting to base64 and forwarding'
+  });
+
+  forwardAudioToAI(connectionId, conn.sessionId, buffer, conn);
 }
 
 async function handleSpeakerJoin(connectionId, payload) {
@@ -193,6 +207,9 @@ async function handleStartSpeaking(connectionId, payload) {
   conn.traceId = uuidv4();
   conn.seqNo = 0;
 
+  // Reset session health for fresh start
+  sessionHealth.delete(conn.sessionId);
+
   slog('info', 'node', 'start_speaking', {
     sessionId: conn.sessionId,
     traceId: conn.traceId,
@@ -236,6 +253,9 @@ async function handleStopSpeaking(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
 
+  // Clean up session health tracking
+  sessionHealth.delete(conn.sessionId);
+
   slog('info', 'node', 'stop_speaking', {
     sessionId: conn.sessionId,
     traceId: conn.traceId,
@@ -264,8 +284,8 @@ async function handleAudioChunk(connectionId, payload) {
 
   conn.seqNo++;
 
-  // Forward to AI service for translation
-  forwardAudioToAI(conn.sessionId, payload.audioData, conn);
+  // Forward to AI service for translation (single canonical path)
+  forwardAudioToAI(connectionId, conn.sessionId, payload.audioData, conn);
 
   // Bypass: stream raw audio directly to same-language listeners
   if (conn.sourceLanguage) {
@@ -275,40 +295,110 @@ async function handleAudioChunk(connectionId, payload) {
 }
 
 /**
- * Forward audio to AI service with trace metadata.
+ * Forward audio to AI service via POST /process-audio.
+ * This is the SINGLE canonical path for audio dispatch.
+ *
+ * Error handling:
+ * - ALL errors are logged (including 404 — previously suppressed)
+ * - Consecutive failures tracked per session
+ * - After 5 consecutive failures → session marked degraded → speaker notified
+ * - Degraded sessions stop dispatching to avoid tight retry loops
  */
-async function forwardAudioToAI(sessionId, audioData, conn) {
+async function forwardAudioToAI(connectionId, sessionId, audioData, conn) {
+  const seqNo = conn ? conn.seqNo : 0;
+  const traceId = conn ? conn.traceId : null;
+  const dst = `${AI_SERVICE_URL}/process-audio`;
+
+  // If session is already degraded, do not retry in a tight loop
+  const health = sessionHealth.get(sessionId);
+  if (health && health.degraded) {
+    // Log once every 200 chunks so we know it's still happening
+    if (seqNo % 200 === 1) {
+      slog('warn', 'node', 'audio_dispatch_skipped', {
+        sessionId, traceId, seqNo,
+        reason: 'session_degraded',
+        consecutiveErrors: health.consecutiveErrors,
+        note: 'Session degraded — not dispatching audio. Speaker should stop and restart.'
+      });
+    }
+    return;
+  }
+
   try {
     const base64Audio = typeof audioData === 'string'
       ? audioData
       : audioData.toString('base64');
 
-    const seqNo = conn ? conn.seqNo : 0;
-    const traceId = conn ? conn.traceId : null;
-
-    // Log every 50th chunk to avoid log spam
+    // Structured dispatch log every 50th chunk
     if (seqNo % 50 === 1) {
-      slog('debug', 'node', 'forward_audio', {
+      slog('info', 'node', 'audio_dispatch', {
         sessionId,
         traceId,
         seqNo,
+        mode: 'stream',
+        dst,
         bytes: Buffer.from(base64Audio, 'base64').length
       });
     }
 
-    await axios.post(`${AI_SERVICE_URL}/process-audio`, {
+    await axios.post(dst, {
       sessionId,
       traceId,
       seqNo,
       audioData: base64Audio
     }, { timeout: 10000 });
+
+    // Success — reset consecutive error count
+    if (health && health.consecutiveErrors > 0) {
+      health.consecutiveErrors = 0;
+    }
   } catch (error) {
-    if (!error.response || error.response.status !== 404) {
-      slog('error', 'node', 'forward_audio_fail', {
+    const status = error.response?.status;
+    const errBody = error.response?.data || error.message;
+
+    // Log ALL errors — never suppress (previously 404 was silently dropped)
+    slog('error', 'node', 'audio_dispatch_fail', {
+      sessionId,
+      traceId,
+      seqNo,
+      status,
+      dst,
+      error: errBody,
+      note: status === 404
+        ? 'Python session not found — session was destroyed or never started'
+        : `Audio dispatch failed with HTTP ${status || 'network error'}`
+    });
+
+    // Track consecutive failures
+    if (!sessionHealth.has(sessionId)) {
+      sessionHealth.set(sessionId, { consecutiveErrors: 0, degraded: false, lastErrorStatus: null });
+    }
+    const h = sessionHealth.get(sessionId);
+    h.consecutiveErrors++;
+    h.lastErrorStatus = status;
+
+    // After 5 consecutive failures → mark degraded and notify speaker ONCE
+    if (h.consecutiveErrors >= 5 && !h.degraded) {
+      h.degraded = true;
+
+      slog('error', 'node', 'session_degraded', {
         sessionId,
-        error: error.response?.data || error.message,
-        status: error.response?.status
+        traceId,
+        consecutiveErrors: h.consecutiveErrors,
+        lastStatus: status,
+        note: 'Translation pipeline degraded — audio not reaching AI service. Speaker must restart.'
       });
+
+      // Notify speaker via WebSocket
+      if (connectionId) {
+        sendMessage(connectionId, {
+          type: 'error',
+          payload: {
+            message: 'Translation session lost. Please stop and restart speaking.',
+            code: 'SESSION_DEGRADED'
+          }
+        });
+      }
     }
   }
 }
@@ -390,6 +480,9 @@ async function broadcastToListeners(sessionId, language, audioData, subtitleText
 async function handleSpeakerDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
+
+  // Clean up session health tracking
+  sessionHealth.delete(conn.sessionId);
 
   try {
     await axios.post(`${AI_SERVICE_URL}/end-session`, {

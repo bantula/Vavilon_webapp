@@ -100,6 +100,7 @@ Resource group: `vavilon-rg`
 |------|---------|
 | `DEPLOYMENT.md` | Full Azure deployment guide (all steps) |
 | `debug/send_test_audio.py` | End-to-end pipeline test script — streams audio chunks, checks trace/metrics |
+| `debug/test_no_404.py` | Integration test: sends 5 simulated utterances, asserts zero 404s from /process-audio |
 | `help/dubber.py` | Legacy hardware version code — NOT used in web app, safe to delete |
 | `help/audio_interface.py` | Legacy UDP streaming code — NOT used in web app, safe to delete |
 | `help/auxiliary_functions.py` | Legacy helper functions — NOT used in web app, safe to delete |
@@ -594,9 +595,10 @@ Speaker mic → audio_chunk → Node backend
 
 ### AI Service Debug Endpoints
 - **POST /start-session** — returns `trace_id` for the session
-- **GET /debug/trace/:trace_id** — retrieves ring buffer of last 100 trace events for a session
+- **GET /debug/trace/:trace_id** — retrieves ring buffer of last 200 trace events for a session
 - **GET /metrics** — returns session counts, recognition stats, TTS queue depths, error counts
 - **GET /health** — basic health check endpoint
+- **GET /routes** — lists all registered Flask routes (quick route verification)
 
 ### AI Service Instrumentation
 - **Metrics collection** — tracks active sessions, total recognitions, TTS operations, errors
@@ -652,6 +654,68 @@ az container create `
 ```
 
 **Key Learning**: `az container restart` preserves env vars, but if the container was originally created without `NODE_BACKEND_URL`, restarting won't add it. Must use `az container create` to update env vars (it replaces the container).
+
+---
+
+### ✅ /process-audio 404 After ~3 Sentences — FIXED
+**Status**: Root cause identified and fixed
+**Symptom**: Translation works for the first 1–3 sentences, then permanently stops. Server logs show:
+```
+POST /process-audio HTTP/1.1" 404
+{"error":"Session not found. Call /start-session first."}
+```
+Speaker receives no feedback. Node.js logs show nothing because the 404 was silently suppressed.
+
+**Root Cause (two problems)**:
+1. **Python session dies silently** — Azure SDK recognizer crashes (unhandled exception in callback, resource exhaustion from unbounded TTS threads, or `_on_canceled` firing). When the session object is destroyed, `/process-audio` returns 404 ("Session not found").
+2. **Node.js silently suppressed 404 errors** — `wsHandler.js` line 306 had:
+   ```js
+   if (!error.response || error.response.status !== 404) {
+     // log error
+   }
+   ```
+   This intentionally hid 404 errors, making the session failure completely invisible. The speaker was never notified. Audio chunks continued being sent into a void.
+
+**Canonical Audio Routing** (single path — no REST fallback, no alternative endpoints):
+```
+Browser → WebSocket audio_chunk → Node.js handleAudioChunk()
+  → forwardAudioToAI() → HTTP POST /process-audio → Python AI Service
+    → session.push_audio(bytes) → Azure PushAudioInputStream
+```
+There is exactly ONE code path. No legacy fallback. No binary message alternative.
+
+**Changes Applied**:
+1. ✅ **Removed silent 404 suppression** — ALL errors from `/process-audio` are now logged with full context (status, response body, seq_no, trace_id)
+2. ✅ **Session health degradation tracking** — `sessionHealth` Map tracks consecutive errors per session. After 5 consecutive failures, session is marked `degraded`.
+3. ✅ **Speaker notification** — When session degrades, speaker receives WebSocket message `{ type: 'error', payload: { code: 'SESSION_DEGRADED', message: '...' } }`
+4. ✅ **Degraded dispatch skip** — Once degraded, audio dispatch is skipped (no tight retry loop). Logged once every 200 chunks for visibility.
+5. ✅ **Health reset on start/stop/disconnect** — `sessionHealth.delete()` called when speaker starts, stops, or disconnects.
+6. ✅ **Binary message logging** — `handleBinaryMessage()` now logs a warning when raw binary audio is received (non-JSON path).
+7. ✅ **GET /routes endpoint on Python** — Returns all registered Flask routes for quick verification.
+8. ✅ **Integration test** — `debug/test_no_404.py` sends 5 simulated utterances, asserts zero 404s, checks trace events.
+
+**Files Modified**:
+- `backend/src/websocket/wsHandler.js` — Rewrote `forwardAudioToAI()`, added `sessionHealth` Map, enhanced `handleBinaryMessage()`
+- `ai-service/src/app.py` — Added `GET /routes` endpoint
+- `debug/test_no_404.py` — New integration test script
+
+**How to Test Locally**:
+```bash
+# 1. Start all three services
+cd backend && npm start          # port 3000
+cd ai-service && python src/app.py  # port 5000
+cd frontend && npm run dev       # port 5173
+
+# 2. Run the integration test (no browser needed)
+python debug/test_no_404.py http://localhost:5000
+
+# 3. Expected: "ALL CHECKS PASSED", zero 404 errors
+
+# 4. Browser test: speak 5+ sentences, watch Node logs for:
+#    - audio_dispatch (every 50th chunk)
+#    - NO audio_dispatch_fail entries
+#    - NO session_degraded entries
+```
 
 ---
 
