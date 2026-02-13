@@ -248,6 +248,7 @@ async function handleStartSpeaking(connectionId, payload) {
 
 /**
  * Speaker clicked "Stop Speaking".
+ * Fire-and-forget to prevent blocking the WebSocket handler.
  */
 async function handleStopSpeaking(connectionId) {
   const conn = connections.get(connectionId);
@@ -259,20 +260,35 @@ async function handleStopSpeaking(connectionId) {
   slog('info', 'node', 'stop_speaking', {
     sessionId: conn.sessionId,
     traceId: conn.traceId,
-    totalChunks: conn.seqNo
+    totalChunks: conn.seqNo,
+    note: 'Ending session (fire-and-forget)'
   });
 
-  try {
-    await axios.post(`${AI_SERVICE_URL}/end-session`, {
-      sessionId: conn.sessionId,
-      traceId: conn.traceId
-    }, { timeout: 10000 });
-  } catch (error) {
-    slog('error', 'node', 'ai_session_end_fail', {
-      sessionId: conn.sessionId,
-      error: error.message
+  // Fire-and-forget: don't await the /end-session call
+  // This prevents blocking if the Python service is slow or times out
+  axios.post(`${AI_SERVICE_URL}/end-session`, {
+    sessionId: conn.sessionId,
+    traceId: conn.traceId
+  }, { timeout: 5000 })
+    .then(() => {
+      slog('info', 'node', 'ai_session_ended', {
+        sessionId: conn.sessionId,
+        traceId: conn.traceId
+      });
+    })
+    .catch((error) => {
+      // Log but don't fail - session will be cleaned up on Python side eventually
+      slog('warn', 'node', 'ai_session_end_fail', {
+        sessionId: conn.sessionId,
+        traceId: conn.traceId,
+        error: error.message,
+        note: 'Failed to cleanly end AI session - session may be orphaned'
+      });
     });
-  }
+
+  // Reset connection state immediately (don't wait for Python)
+  conn.traceId = null;
+  conn.seqNo = 0;
 }
 
 /**
@@ -350,11 +366,21 @@ async function forwardAudioToAI(connectionId, sessionId, audioData, conn) {
 
     // Success — reset consecutive error count
     if (health && health.consecutiveErrors > 0) {
+      const prevErrors = health.consecutiveErrors;
       health.consecutiveErrors = 0;
+      // Log recovery from error state
+      slog('info', 'node', 'session_recovered', {
+        sessionId,
+        traceId,
+        seqNo,
+        previousErrors: prevErrors,
+        note: 'Session recovered from error state - audio dispatch successful'
+      });
     }
   } catch (error) {
     const status = error.response?.status;
     const errBody = error.response?.data || error.message;
+    const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
 
     // Log ALL errors — never suppress (previously 404 was silently dropped)
     slog('error', 'node', 'audio_dispatch_fail', {
@@ -364,7 +390,11 @@ async function forwardAudioToAI(connectionId, sessionId, audioData, conn) {
       status,
       dst,
       error: errBody,
-      note: status === 404
+      isTimeout,
+      errorCode: error.code,
+      note: isTimeout 
+        ? 'Audio dispatch TIMEOUT - AI service not responding within 10s'
+        : status === 404
         ? 'Python session not found — session was destroyed or never started'
         : `Audio dispatch failed with HTTP ${status || 'network error'}`
     });
@@ -484,15 +514,31 @@ async function handleSpeakerDisconnect(connectionId) {
   // Clean up session health tracking
   sessionHealth.delete(conn.sessionId);
 
-  try {
-    await axios.post(`${AI_SERVICE_URL}/end-session`, {
-      sessionId: conn.sessionId,
-      traceId: conn.traceId
-    }, { timeout: 5000 });
-  } catch (error) {
-    // ignore
-  }
+  slog('info', 'node', 'speaker_disconnect', { 
+    sessionId: conn.sessionId, 
+    traceId: conn.traceId,
+    note: 'Speaker disconnected - cleaning up session'
+  });
 
+  // Fire-and-forget: don't block on /end-session
+  axios.post(`${AI_SERVICE_URL}/end-session`, {
+    sessionId: conn.sessionId,
+    traceId: conn.traceId
+  }, { timeout: 5000 })
+    .then(() => {
+      slog('info', 'node', 'ai_session_ended_disconnect', {
+        sessionId: conn.sessionId,
+        traceId: conn.traceId
+      });
+    })
+    .catch((error) => {
+      slog('warn', 'node', 'ai_session_end_fail_disconnect', {
+        sessionId: conn.sessionId,
+        error: error.message
+      });
+    });
+
+  // Continue with cleanup immediately
   await setSpeakerConnected(conn.sessionId, false);
 
   const session = await getSession(conn.sessionId);
@@ -506,8 +552,6 @@ async function handleSpeakerDisconnect(connectionId) {
       });
     }
   }
-
-  slog('info', 'node', 'speaker_disconnect', { sessionId: conn.sessionId, traceId: conn.traceId });
 }
 
 async function handleDisconnect(connectionId) {

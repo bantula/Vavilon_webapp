@@ -273,34 +273,66 @@ class TranslationSession:
                       stream_open=not self._stream_closed)
 
     def stop(self):
+        """
+        Stop the translation session.
+        Uses timeouts to prevent blocking indefinitely.
+        Returns quickly even if cleanup isn't complete.
+        """
         self._log('info', 'stopping',
                   total_bytes=self._total_bytes_pushed,
                   recognize_count=self._recognize_count,
                   lifecycle_state='stopping',
                   note='Explicit stop() called - ending session')
+        
+        # Signal all threads to stop
         self._stop_event.set()
 
+        # Stop TTS threads first
         for lang, info in self._synth_threads.items():
             info["running"] = False
 
-        # Shutdown TTS thread pool gracefully
-        try:
-            self._log('info', 'shutting_down_tts_executor')
-            self._tts_executor.shutdown(wait=True)
+        # Shutdown TTS thread pool with timeout (don't block forever)
+        # Note: Python 3.9 doesn't have timeout parameter on shutdown()
+        # We use threading.Timer to ensure we don't block indefinitely
+        executor_done = threading.Event()
+        
+        def shutdown_executor():
+            try:
+                self._tts_executor.shutdown(wait=True)
+                executor_done.set()
+            except Exception as e:
+                self._log('error', 'tts_executor_shutdown_fail', error=str(e))
+                executor_done.set()
+        
+        shutdown_thread = threading.Thread(target=shutdown_executor, daemon=True)
+        shutdown_thread.start()
+        
+        self._log('info', 'shutting_down_tts_executor',
+                  timeout_seconds=3.0,
+                  note='Waiting for TTS threads to finish')
+        
+        # Wait up to 3 seconds for shutdown to complete
+        if not executor_done.wait(timeout=3.0):
+            self._log('warn', 'tts_executor_shutdown_timeout',
+                      note='TTS threads did not finish in 3s - continuing anyway')
+        else:
             self._log('info', 'tts_executor_shutdown_complete')
-        except Exception as e:
-            self._log('error', 'tts_executor_shutdown_fail', error=str(e))
 
+        # Stop recognizer with timeout
         if self._translation_recognizer and not self._recognition_stopped:
             try:
                 self._log('info', 'stopping_recognition',
-                          method='stop_continuous_recognition_async')
+                          method='stop_continuous_recognition_async',
+                          note='Stopping Azure recognizer')
+                # Azure SDK doesn't support timeout on this call, but it's usually fast
                 self._translation_recognizer.stop_continuous_recognition_async().get()
                 self._recognition_stopped = True
                 self._log('info', 'recognition_stopped')
             except Exception as e:
-                self._log('error', 'stop_recognizer_fail', error=str(e))
+                self._log('error', 'stop_recognizer_fail', error=str(e),
+                          note='Recognizer stop failed but continuing cleanup')
 
+        # Close audio stream
         if not self._stream_closed:
             try:
                 self._log('info', 'closing_audio_stream')
@@ -310,7 +342,8 @@ class TranslationSession:
             except Exception as e:
                 self._log('error', 'close_stream_fail', error=str(e))
 
-        self._log('info', 'stopped', lifecycle_state='stopped')
+        self._log('info', 'stopped', lifecycle_state='stopped',
+                  cleanup_complete=self._recognition_stopped and self._stream_closed)
 
     # ── Recognition callbacks ───────────────────────────────────
 
@@ -521,10 +554,14 @@ class TranslationSession:
                   mode=mode,
                   thread_pool='bounded_executor')
 
-        while self._synth_threads[language]["running"]:
+        while self._synth_threads[language]["running"] and not self._stop_event.is_set():
             try:
-                text = self._translated_text_queues[language].get(timeout=0.5)
+                # Reduced timeout for faster exit on stop
+                text = self._translated_text_queues[language].get(timeout=0.2)
             except queue.Empty:
+                # Check stop_event more frequently
+                if self._stop_event.is_set():
+                    break
                 continue
 
             t0 = time.time()
@@ -584,7 +621,14 @@ class TranslationSession:
                 except ValueError:
                     pass
 
-        self._log('info', 'synth_thread_exit', language=language)
+        # Thread exiting - log the reason
+        exit_reason = 'stop_event' if self._stop_event.is_set() else 'running_flag_cleared'
+        self._log('info', 'synth_thread_exit', 
+                  language=language,
+                  exit_reason=exit_reason,
+                  stop_event_set=self._stop_event.is_set(),
+                  running_flag=self._synth_threads[language]["running"],
+                  note='TTS thread exiting cleanly')
 
     def _sdk_tts(self, language, text):
         """Synthesize speech using Azure Speech SDK (native library)."""
