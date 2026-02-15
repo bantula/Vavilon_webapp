@@ -114,6 +114,8 @@ class TranslationSession:
         self._synth_threads: Dict[str, dict] = {}
         # Bounded thread pool for TTS: max 2 concurrent per session
         self._tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f'tts-{session_id}')
+        # Lock for thread-safe dynamic worker creation
+        self._worker_lock = threading.Lock()
 
         # Non-blocking audio queue: push_audio() never blocks Flask
         self._audio_queue: queue.Queue = queue.Queue(maxsize=200)
@@ -321,10 +323,81 @@ class TranslationSession:
                   total_bytes=self._total_bytes_pushed,
                   alive=self._alive)
 
+    def _ensure_tts_worker(self, language: str):
+        """
+        Dynamically create TTS worker thread for a language if it doesn't exist.
+        Thread-safe: uses lock to prevent race conditions when multiple requests
+        arrive simultaneously for the same new language.
+        """
+        # Fast path: worker already exists (no lock needed for read)
+        if language in self._synth_threads and self._synth_threads[language]["running"]:
+            return True
+        
+        # Slow path: need to create worker (acquire lock)
+        with self._worker_lock:
+            # Double-check: another thread may have created it while we waited
+            if language in self._synth_threads and self._synth_threads[language]["running"]:
+                return True
+            
+            self._log('info', 'dynamic_worker_creation_start',
+                      language=language,
+                      note='Creating TTS worker for language that joined mid-session')
+            
+            try:
+                # Create queue
+                if language not in self._translated_text_queues:
+                    self._translated_text_queues[language] = queue.Queue()
+                    self._log('info', 'tts_queue_created', language=language)
+                
+                # Create synthesizer (if using SDK mode)
+                if not self._use_rest_tts and language not in self._synthesizers:
+                    speech_config = speechsdk.SpeechConfig(
+                        subscription=self.speech_key,
+                        region=self.region
+                    )
+                    locale = self.TTS_LOCALE_MAP.get(language, 'en-US')
+                    voice_name = self.TTS_VOICE_MAP.get(locale, 'en-US-JennyNeural')
+                    
+                    speech_config.speech_synthesis_language = locale
+                    speech_config.speech_synthesis_voice_name = voice_name
+                    speech_config.set_speech_synthesis_output_format(
+                        speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
+                    )
+                    
+                    self._synthesizers[language] = speechsdk.SpeechSynthesizer(
+                        speech_config=speech_config,
+                        audio_config=None
+                    )
+                    self._log('info', 'tts_synthesizer_created',
+                              language=language, locale=locale, voice=voice_name)
+                
+                # Create worker thread
+                self._synth_threads[language] = {
+                    "running": True,
+                    "future": None
+                }
+                future = self._tts_executor.submit(self._voice_synth, language)
+                self._synth_threads[language]["future"] = future
+                
+                self._log('info', 'dynamic_worker_created',
+                          language=language,
+                          worker_count=len(self._synth_threads),
+                          note='New TTS worker started successfully')
+                
+                return True
+            
+            except Exception as e:
+                self._log('error', 'dynamic_worker_creation_failed',
+                          language=language,
+                          error=str(e),
+                          traceback=traceback.format_exc())
+                return False
+
     def generate_tts(self, segment_id: str, translations: dict):
         """
         Queue TTS for explicit languages. Called by Node after segment_finalized.
         No global active-language state — Node sends exactly which languages need TTS.
+        Dynamically creates TTS workers for new languages that join mid-session.
         """
         enqueued = []
         
@@ -334,11 +407,12 @@ class TranslationSession:
                   requested_languages=list(translations.keys()))
         
         for lang, text in translations.items():
-            if lang not in self._translated_text_queues:
-                self._log('warn', 'tts_language_not_init',
+            # Ensure TTS worker exists for this language (creates if missing)
+            if not self._ensure_tts_worker(lang):
+                self._log('error', 'tts_worker_creation_failed',
                           language=lang,
                           segment_id=segment_id,
-                          note='Language not in target_languages - skipping')
+                          note='Could not create TTS worker - skipping this language')
                 continue
             
             try:

@@ -11,9 +11,10 @@
 
 **Current Status:**
 - **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming.
-- **Fails:** TTS audio delivery completely non-functional. Italian listener receives subtitles but no audio. Node requests TTS from Python (200 OK response), but Python never synthesizes or emits audio.
+- **Fixed (Pending Deploy):** Dynamic TTS worker creation implemented. Workers now spawn on-demand when new languages join mid-session.
+- **Testing Required:** Deploy to Azure and verify Italian listener joining mid-session receives audio.
 
-**Next Action:** Execute [PLAN.md](PLAN.md) Phase 1-3 to add dynamic TTS worker thread creation when new languages join mid-session (currently workers only created at session start).
+**Next Action:** Deploy updated AI service to Azure Container Instance and test with dynamic listener join scenario (execute Phase 5 in [PLAN.md](PLAN.md)). Implementation complete: dynamic TTS worker creation now spawns threads on-demand for languages that join mid-session.
 
 ---
 
@@ -55,33 +56,29 @@ Browser ──WebSocket──> Node.js ──HTTP REST──> Python AI
 
 ### What Fails / Unstable (Current P0s)
 
-#### P0: TTS Delivery Failure  No Audio Generated
+#### P0: TTS Delivery Failure → No Audio Generated (✅ FIXED)
 
 **Label:** TTS worker thread lifecycle bug  
-**Symptoms:**
-- Subtitles appear correctly (translation works)
-- Zero audio delivered to listeners
-- Node sends `POST /generate-tts`  Python returns 200 OK with `{"enqueued":["it"]}`
-- Node waits 10s, logs `missing_tts_for_active_language` timeout
-- Python logs show TTS enqueued but NO synthesis activity
-
-**Reproduction:**
-```bash
-1. Start speaker session (source: English)
-2. Join as listener (target: Italian)
-3. Speak 3 sentences
-4. Observe: Subtitles appear , audio never plays 
-5. Check logs: Node shows tts_languages_requested:["it"], generate_tts_sent
-6. Python logs: tts_enqueued for Italian, but no tts_worker_alive for Italian
-```
+**Status:** Fixed, pending deployment and testing
 
 **Root Cause:** TTS worker threads initialized ONCE at session start based on initial listener languages. Italian listener joined later; no Italian worker thread exists to process queue. Only German/Spanish workers visible in logs (from earlier test). Enqueued jobs sit in queue forever.
 
-**Immediate Mitigation:** Restart session with Italian listener BEFORE speaker starts talking (so `target_languages` includes Italian at session creation).
+**Fix Implemented:**
+- Added `_ensure_tts_worker()` method in `speech_service.py`
+- Dynamically creates queue, synthesizer, and worker thread for new languages
+- Thread-safe with lock + double-check pattern to prevent race conditions
+- `generate_tts()` now calls `_ensure_tts_worker()` before enqueuing TTS
+- Workers spawn on-demand when listeners join mid-session
 
-**Permanent Fix:** Implement dynamic worker creation in `generate_tts()` method. Check if worker thread exists for language; if not, spawn new thread on-demand. See [PLAN.md](PLAN.md) Phase 4 Option A.
+**Testing Plan:**
+1. Start speaker session (source: English)
+2. Join as listener (target: German)
+3. Speak 1 sentence → verify German audio works
+4. Join second listener (target: Italian) mid-session
+5. Speak 2 more sentences → verify Italian audio delivered
+6. Check logs: `dynamic_worker_created` for Italian language
 
-**Investigation Status:** See [PLAN.md](PLAN.md) for comprehensive investigation and fix strategy across 5 phases.
+**Implementation Details:** See [PLAN.md](PLAN.md) Implementation Complete section.
 
 ---
 
