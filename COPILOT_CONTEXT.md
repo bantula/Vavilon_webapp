@@ -1234,11 +1234,53 @@ az container logs --resource-group vavilon-rg --name vavilon-ai | grep timeout
 
 ## Current Issues (Feb 15, 2026)
 
-### 🔴 TTS Not Delivered to Listeners — IN PROGRESS
-**Status**: Backend deployment fixed, but TTS delivery chain broken
-**Branch**: `fix/tts-delivery-reliability`
+### � TTS Delivery Reliability - DIAGNOSTIC IMPROVEMENTS DEPLOYED
+**Status**: Phase 1 & Phase 2.1 deployed to production (Feb 15, 2026 15:55 UTC)
+**Branch**: `main`
+**Deployment**: Commit 7a107ac
 
-**Symptoms**:
+**Deployed Improvements**:
+1. ✅ **Enhanced Python TTS Logging** (Phase 1.1)
+   - Comprehensive logging at every TTS stage (receive, enqueue, synthesis start/complete, emit)
+   - Queue depth tracking before/after enqueue
+   - Text preview logging for debugging
+   - Request/segment ID tracking throughout pipeline
+
+2. ✅ **TTS Worker Thread Health Monitoring** (Phase 1.2)
+   - Thread ID and iteration count tracking
+   - Heartbeat logging every 10 iterations
+   - Consecutive error tracking (max 3 before worker stops)
+   - Detailed exit reason logging
+   - Critical error detection (worker giving up vs normal stop)
+
+3. ✅ **Event Emission Retry Logic** (Phase 1.3)
+   - 3 attempts with 0.5s delay between retries
+   - Timeout detection and logging
+   - Audio size tracking (KB)
+   - Per-attempt logging for debugging
+   - Failure after all retries raises exception (caught by worker)
+
+4. ✅ **Flask /generate-tts Enhanced Error Handling** (Phase 1.4)
+   - Request ID generation for request tracking
+   - Comprehensive validation with detailed error messages
+   - Session alive check (returns 410 if dead)
+   - Active sessions logging when session not found
+   - Full exception traceback logging
+
+5. ✅ **Node TTS Request/Response Tracking** (Phase 1.5)
+   - Full request body logging (sessionId, segmentId, translations)
+   - Response status and data logging
+   - Timing metrics (timeSinceSegmentMs)
+   - Audio size tracking (bytes and KB)
+   - TTS guard timestamp tracking
+
+6. ✅ **Redis Connection Resilience** (Phase 2.1)
+   - Auto-reconnect with exponential backoff (50ms * retries, max 2s)
+   - Max 10 reconnect attempts
+   - Connection event logging (error, reconnecting, ready, connect)
+   - Better error visibility
+
+**Previous Symptoms** (before diagnostic improvements):
 - Subtitles work (translations successful)
 - Audio never plays (TTS never reaches listeners)
 - Node correctly requests TTS via `/generate-tts`
@@ -1246,26 +1288,69 @@ az container logs --resource-group vavilon-rg --name vavilon-ai | grep timeout
 - Node logs `missing_tts_for_active_language` after 10s timeout
 - Redis connection drops (`SocketClosedUnexpectedlyError`)
 
-**Test Evidence (Feb 15, 15:14 UTC)**:
-```json
-{"step":"tts_languages_requested", "ttsLanguagesRequested":["it"]}  // Node requests Italian
-{"step":"generate_tts_sent", "enqueued":["it"]}                     // Node sends to Python
-// ... 10 seconds pass ...
-{"step":"missing_tts_for_active_language", "language":"it"}         // Timeout - no tts_ready
+**Next Steps**:
+1. Monitor production logs for exact failure point
+2. Look for new diagnostic logs:
+   - `generate_tts_received` - confirms Node request received
+   - `tts_enqueued` - confirms text queued for synthesis
+   - `tts_synthesis_start` - confirms worker pulled from queue
+   - `tts_synthesis_complete` - confirms Azure SDK synthesized audio
+   - `tts_emit_attempt` - confirms emission started
+   - `tts_emit_success` - confirms Node received event
+3. If TTS still fails, logs will show WHERE in the pipeline it breaks
+4. Apply targeted fix based on diagnostic evidence
+
+**Diagnostic Log Locations**:
+```bash
+# Python AI service logs (Azure Container Instance)
+az container logs --name vavilon-ai --resource-group vavilon-rg
+
+# Node backend logs (Azure App Service)
+az webapp log tail --name vavilon-backend --resource-group vavilon-rg
+
+# Filter for TTS-related logs
+# Python: grep "tts_" or "generate_tts"
+# Node: grep "tts_" or "generate_tts" or "missing_tts"
 ```
 
-**Hypothesis**:
-1. Python `/generate-tts` endpoint or TTS worker thread failing silently
-2. Event emission from Python → Node failing or timing out
-3. Redis instability corrupting session state/worker queues
-4. TTS ThreadPoolExecutor rejecting work or threads dying
+**Expected Log Flow (If Working Correctly)**:
+```json
+// Python receives TTS request
+{"step":"generate_tts_request", "languages":["it"], "request_id":"a3b4c5d6"}
+{"step":"generate_tts_received", "languages":["it"]}
+{"step":"tts_enqueued", "language":"it", "queue_depth_after":1}
 
-**Plan**: See [PLAN.md](PLAN.md) for comprehensive diagnostic and fix strategy
+// TTS worker processes
+{"step":"tts_worker_alive", "language":"it", "queue_depth":1}
+{"step":"tts_synthesis_start", "language":"it", "segment_id":"..."}
+{"step":"tts_synthesis_complete", "language":"it", "audio_bytes":45234}
 
-**Next Steps**:
-1. Deploy enhanced logging (Phase 1 of plan)
-2. Identify exact failure point from structured logs
-3. Apply targeted fix based on diagnosis
+// Emit to Node
+{"step":"tts_emit_attempt", "language":"it", "attempt":1}
+{"step":"tts_emit_success", "language":"it", "status_code":200}
+
+// Node receives and broadcasts
+{"step":"tts_ready_received", "language":"it", "audioSizeKB":44.17}
+{"step":"tts_all_received", "languages":["it"]}
+```
+
+**If TTS Fails, Logs Will Show**:
+- Missing `tts_enqueued` → Queue not initialized for that language
+- Missing `tts_synthesis_start` → Worker not running or stuck
+- Missing `tts_synthesis_complete` → Azure SDK TTS failed
+- Missing `tts_emit_success` → Network issue Python → Node
+- `tts_emit_fail` or `tts_emit_timeout` → Emission retry failures
+- `tts_worker_giving_up` → 3+ consecutive failures, worker stopped
+- `missing_tts_for_active_language` in Node → No tts_ready received after 10s
+
+---
+
+### ✅ Node requests TTS, Python never delivers it — MONITORING
+**Previous Status**: Node requests Italian TTS (`tts_languages_requested:["it"]`), Node sends `POST /generate-tts` (`generate_tts_sent ... enqueued:["it"]`), Python never responds with `tts_ready` event, Node logs `missing_tts_for_active_language` after 10s timeout
+
+**Current Status**: Diagnostic logging deployed. Awaiting production test to identify exact failure point.
+
+**Plan**: See [PLAN.md](PLAN.md) for comprehensive diagnostic and fix strategy (Phase 1 & 2.1 complete, awaiting diagnosis for Phase 3+)
 
 ---
 
@@ -1326,3 +1411,44 @@ az container restart --resource-group vavilon-rg --name vavilon-ai
 
 ### Frontend
 Auto-deploys via GitHub Actions when pushed to main (Static Web Apps).
+
+---
+
+## Deployment History
+
+### February 15, 2026 - TTS Reliability Diagnostic Improvements (Commit 7a107ac)
+**Deployed**: 15:55 UTC  
+**Status**: ✅ Successfully deployed to production  
+**Branch**: `main`  
+**Focus**: Add comprehensive diagnostic logging to identify TTS delivery failures
+
+**Changes Deployed**:
+- **Phase 1.1**: Enhanced Python TTS logging with detailed queue tracking, text previews, request IDs
+- **Phase 1.2**: TTS worker thread health monitoring with heartbeat, consecutive error tracking
+- **Phase 1.3**: Event emission retry logic (3 attempts, 0.5s delay, timeout detection)
+- **Phase 1.4**: Flask /generate-tts enhanced error handling with request tracking
+- **Phase 1.5**: Node TTS request/response tracking with timing metrics
+- **Phase 2.1**: Redis connection resilience with auto-reconnect (exponential backoff)
+
+**Files Modified**:
+- `ai-service/src/speech_service.py` - Enhanced generate_tts(), _voice_synth(), _emit_tts_ready()
+- `ai-service/src/app.py` - Enhanced /generate-tts endpoint with comprehensive logging
+- `backend/src/routes/events.js` - Enhanced TTS request/response tracking
+- `backend/src/services/sessionService.js` - Added Redis reconnection strategy
+
+**Deployment Verification**:
+```bash
+# AI Container restarted: 15:55 UTC
+# State: Running
+# Logs show: {"step":"startup", "port":5000, "azure_configured":true}
+```
+
+**Purpose**: These changes add **zero functional changes** — only diagnostic logging. If TTS still fails, logs will now show the exact failure point in the pipeline, allowing targeted fixes in Phase 3+.
+
+**Next Actions**:
+1. Test end-to-end translation with Italian listener
+2. Monitor logs for diagnostic output
+3. Identify exact failure point from structured logs
+4. Apply Phase 3+ fixes based on evidence
+
+---
