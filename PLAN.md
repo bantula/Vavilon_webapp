@@ -600,13 +600,21 @@ Decouple event emission from TTS synthesis:
 
 ---
 
-## Implementation Order
+## Implementation Order (REVISED - Redis First)
 
-1. **Day 1 (2-3 hours)**: Phase 1.1-1.4 — Enhanced logging
-2. **Day 2 (1-2 hours)**: Test with full logging, identify exact failure point
-3. **Day 3 (2-4 hours)**: Fix identified issue (likely event emission or thread startup)
-4. **Day 4 (1-2 hours)**: Phase 2.1 — Redis resilience
+1. **Day 1 (2-3 hours)**: Phase 2.1 — Redis connection resilience (TOP PRIORITY)
+2. **Day 2 (2-3 hours)**: Phase 1.1-1.4 — Enhanced logging for TTS pipeline
+3. **Day 3 (1-2 hours)**: Test with full logging, identify exact failure point
+4. **Day 4 (2-4 hours)**: Fix identified TTS issue (likely event emission or thread startup)
 5. **Day 5 (1 hour)**: Full regression testing
+
+**Rationale**: Redis disconnects can cascade into multiple failures:
+- Session state corruption
+- Lost event subscriptions
+- Queue state loss
+- TTS worker failure to emit events
+
+Fix the foundation (Redis) first, then debug higher-level issues.
 
 ---
 
