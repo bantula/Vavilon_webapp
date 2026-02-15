@@ -174,6 +174,26 @@ async function getListenersByLanguage(sessionId, language) {
 }
 
 /**
+ * Get all languages that have active listeners in a session
+ * @param {string} sessionId - Session ID
+ * @returns {Promise<Set<string>>} Set of language codes with active listeners
+ */
+async function getSessionListenerLanguages(sessionId) {
+  const session = await getSession(sessionId);
+  const languages = new Set();
+  
+  if (session && session.listeners) {
+    for (const [language, listenerIds] of Object.entries(session.listeners)) {
+      if (listenerIds && listenerIds.length > 0) {
+        languages.add(language);
+      }
+    }
+  }
+  
+  return languages;
+}
+
+/**
  * Set speaker connection status
  */
 async function setSpeakerConnected(sessionId, connected) {
@@ -230,6 +250,7 @@ module.exports = {
   addListener,
   removeListener,
   getListenersByLanguage,
+  getSessionListenerLanguages,
   setSpeakerConnected,
   endSession,
   getSessionStats

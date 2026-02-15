@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
-const { broadcastToListeners, getSessionListenerLanguages } = require('../websocket/wsHandler');
+const { broadcastToListeners } = require('../websocket/wsHandler');
+const { getSessionListenerLanguages } = require('../services/sessionService');
 
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 
@@ -50,8 +51,8 @@ router.post('/', async (req, res) => {
         });
       }
 
-      // Compute active listener languages from live connections
-      const activeLanguages = getSessionListenerLanguages(sessionId);
+      // Compute active listener languages from Redis session data
+      const activeLanguages = await getSessionListenerLanguages(sessionId);
 
       slog('info', 'segment_finalized_received', {
         sessionId,
