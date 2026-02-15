@@ -14,13 +14,6 @@ const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 // Track all WebSocket connections
 const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage, traceId, seqNo }
 
-// Track session health for degradation detection
-// sessionId -> { consecutiveErrors: number, degraded: boolean, lastErrorStatus: number|null }
-const sessionHealth = new Map();
-
-// Track active languages per session for TTS optimization
-// sessionId -> Set<language>
-const sessionActiveLanguages = new Map();
 
 // Structured log helper
 function slog(level, component, step, fields = {}) {
@@ -189,9 +182,6 @@ async function handleListenerJoin(connectionId, payload) {
 
   await addListener(session.id, connectionId, language);
 
-  // Update active languages and notify Python
-  updateSessionActiveLanguages(session.id);
-
   sendMessage(connectionId, {
     type: 'listener_joined',
     payload: { sessionId: session.id, language }
@@ -213,9 +203,6 @@ async function handleStartSpeaking(connectionId, payload) {
   conn.sourceLanguage = sourceLanguage || 'en-US';
   conn.traceId = uuidv4();
   conn.seqNo = 0;
-
-  // Reset session health for fresh start
-  sessionHealth.delete(conn.sessionId);
 
   slog('info', 'node', 'start_speaking', {
     sessionId: conn.sessionId,
@@ -260,9 +247,6 @@ async function handleStartSpeaking(connectionId, payload) {
 async function handleStopSpeaking(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
-
-  // Clean up session health tracking
-  sessionHealth.delete(conn.sessionId);
 
   slog('info', 'node', 'stop_speaking', {
     sessionId: conn.sessionId,
@@ -319,123 +303,55 @@ async function handleAudioChunk(connectionId, payload) {
 
 /**
  * Forward audio to AI service via POST /process-audio.
- * This is the SINGLE canonical path for audio dispatch.
- *
- * Error handling:
- * - ALL errors are logged (including 404 — previously suppressed)
- * - Consecutive failures tracked per session
- * - After 5 consecutive failures → session marked degraded → speaker notified
- * - Degraded sessions stop dispatching to avoid tight retry loops
+ * Thin relay — just pushes bytes into Python's audio queue (non-blocking).
+ * No degradation tracking: Python's queue-based push_audio never blocks.
+ * If Python returns 410 (SESSION_DEAD), the session has crashed.
  */
 async function forwardAudioToAI(connectionId, sessionId, audioData, conn) {
   const seqNo = conn ? conn.seqNo : 0;
   const traceId = conn ? conn.traceId : null;
-  const dst = `${AI_SERVICE_URL}/process-audio`;
-
-  // If session is already degraded, do not retry in a tight loop
-  const health = sessionHealth.get(sessionId);
-  if (health && health.degraded) {
-    // Log once every 200 chunks so we know it's still happening
-    if (seqNo % 200 === 1) {
-      slog('warn', 'node', 'audio_dispatch_skipped', {
-        sessionId, traceId, seqNo,
-        reason: 'session_degraded',
-        consecutiveErrors: health.consecutiveErrors,
-        note: 'Session degraded — not dispatching audio. Speaker should stop and restart.'
-      });
-    }
-    return;
-  }
 
   try {
     const base64Audio = typeof audioData === 'string'
       ? audioData
       : audioData.toString('base64');
 
-    // Structured dispatch log every 50th chunk
+    // Log every 50th chunk
     if (seqNo % 50 === 1) {
       slog('info', 'node', 'audio_dispatch', {
-        sessionId,
-        traceId,
-        seqNo,
-        mode: 'stream',
-        dst,
+        sessionId, traceId, seqNo,
         bytes: Buffer.from(base64Audio, 'base64').length
       });
     }
 
-    await axios.post(dst, {
-      sessionId,
-      traceId,
-      seqNo,
+    await axios.post(`${AI_SERVICE_URL}/process-audio`, {
+      sessionId, traceId, seqNo,
       audioData: base64Audio
-    }, { timeout: 10000 });
-
-    // Success — reset consecutive error count
-    if (health && health.consecutiveErrors > 0) {
-      const prevErrors = health.consecutiveErrors;
-      health.consecutiveErrors = 0;
-      // Log recovery from error state
-      slog('info', 'node', 'session_recovered', {
-        sessionId,
-        traceId,
-        seqNo,
-        previousErrors: prevErrors,
-        note: 'Session recovered from error state - audio dispatch successful'
-      });
-    }
+    }, { timeout: 5000 });
   } catch (error) {
     const status = error.response?.status;
-    const errBody = error.response?.data || error.message;
-    const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
 
-    // Log ALL errors — never suppress (previously 404 was silently dropped)
-    slog('error', 'node', 'audio_dispatch_fail', {
-      sessionId,
-      traceId,
-      seqNo,
-      status,
-      dst,
-      error: errBody,
-      isTimeout,
-      errorCode: error.code,
-      note: isTimeout 
-        ? 'Audio dispatch TIMEOUT - AI service not responding within 10s'
-        : status === 404
-        ? 'Python session not found — session was destroyed or never started'
-        : `Audio dispatch failed with HTTP ${status || 'network error'}`
-    });
-
-    // Track consecutive failures
-    if (!sessionHealth.has(sessionId)) {
-      sessionHealth.set(sessionId, { consecutiveErrors: 0, degraded: false, lastErrorStatus: null });
-    }
-    const h = sessionHealth.get(sessionId);
-    h.consecutiveErrors++;
-    h.lastErrorStatus = status;
-
-    // After 5 consecutive failures → mark degraded and notify speaker ONCE
-    if (h.consecutiveErrors >= 5 && !h.degraded) {
-      h.degraded = true;
-
-      slog('error', 'node', 'session_degraded', {
-        sessionId,
-        traceId,
-        consecutiveErrors: h.consecutiveErrors,
-        lastStatus: status,
-        note: 'Translation pipeline degraded — audio not reaching AI service. Speaker must restart.'
+    // Only log errors periodically to avoid spam (except 410 SESSION_DEAD)
+    if (status === 410) {
+      slog('error', 'node', 'audio_session_dead', {
+        sessionId, traceId, seqNo,
+        note: 'Python session died (recognizer crashed or audio queue full). Speaker must restart.'
       });
-
-      // Notify speaker via WebSocket
+      // Notify speaker once
       if (connectionId) {
         sendMessage(connectionId, {
           type: 'error',
           payload: {
             message: 'Translation session lost. Please stop and restart speaking.',
-            code: 'SESSION_DEGRADED'
+            code: 'SESSION_DEAD'
           }
         });
       }
+    } else if (seqNo % 50 === 1) {
+      slog('error', 'node', 'audio_dispatch_fail', {
+        sessionId, traceId, seqNo, status,
+        error: error.response?.data || error.message
+      });
     }
   }
 }
@@ -518,10 +434,7 @@ async function handleSpeakerDisconnect(connectionId) {
   const conn = connections.get(connectionId);
   if (!conn) return;
 
-  // Clean up session health tracking
-  sessionHealth.delete(conn.sessionId);
-
-  slog('info', 'node', 'speaker_disconnect', { 
+  slog('info', 'node', 'speaker_disconnect', {
     sessionId: conn.sessionId, 
     traceId: conn.traceId,
     note: 'Speaker disconnected - cleaning up session'
@@ -566,8 +479,6 @@ async function handleDisconnect(connectionId) {
   if (!conn) return;
 
   if (conn.role === 'speaker') {
-    // Update active languages when listener disconnects
-    updateSessionActiveLanguages(conn.sessionId);
     await handleSpeakerDisconnect(connectionId);
   } else if (conn.role === 'listener') {
     await removeListener(conn.sessionId, connectionId, conn.language);
@@ -591,63 +502,21 @@ function sendError(connectionId, errorMessage) {
 }
 
 /**
- * Update active languages for a session and notify Python AI service.
- * Only languages with active listeners will have TTS generated.
+ * Get the set of listener languages for a session.
+ * Used by events.js to determine which translations need TTS.
  */
-function updateSessionActiveLanguages(sessionId) {
-  // Count listeners per language
-  const languageCounts = {};
-  for (const [connId, conn] of connections) {
+function getSessionListenerLanguages(sessionId) {
+  const languages = new Set();
+  for (const [, conn] of connections) {
     if (conn.sessionId === sessionId && conn.role === 'listener' && conn.language) {
-      languageCounts[conn.language] = (languageCounts[conn.language] || 0) + 1;
+      languages.add(conn.language);
     }
   }
-
-  // Languages with at least one listener
-  const activeLanguages = Object.keys(languageCounts).filter(lang => languageCounts[lang] > 0);
-  const prevActive = sessionActiveLanguages.get(sessionId) || new Set();
-  const newActive = new Set(activeLanguages);
-
-  // Only update if changed
-  if (!setsEqual(prevActive, newActive)) {
-    sessionActiveLanguages.set(sessionId, newActive);
-
-    slog('info', 'node', 'active_languages_changed', {
-      sessionId,
-      activeLanguages,
-      languageCounts
-    });
-
-    // Notify Python (fire-and-forget to avoid blocking)
-    axios.post(`${AI_SERVICE_URL}/update-active-languages`, {
-      sessionId,
-      activeLanguages
-    }, { timeout: 5000 })
-      .then(() => {
-        slog('info', 'node', 'active_languages_sent', { sessionId, activeLanguages });
-      })
-      .catch((error) => {
-        slog('warn', 'node', 'active_languages_send_fail', {
-          sessionId,
-          error: error.message
-        });
-      });
-  }
-}
-
-/**
- * Helper to compare two sets for equality.
- */
-function setsEqual(a, b) {
-  if (a.size !== b.size) return false;
-  for (const item of a) {
-    if (!b.has(item)) return false;
-  }
-  return true;
+  return languages;
 }
 
 module.exports = {
   setupWebSocket,
   broadcastToListeners,
-  updateActiveLanguages: updateSessionActiveLanguages
+  getSessionListenerLanguages
 };

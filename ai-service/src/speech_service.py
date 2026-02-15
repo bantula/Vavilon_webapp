@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 import time
 import traceback
-from typing import Dict, Callable, Optional, Set
+from typing import Dict, Callable, Optional
 
 
 def _slog(level, step, **kwargs):
@@ -86,10 +86,7 @@ class TranslationSession:
         self._recognition_started = False
         self._recognition_stopped = False
         self._stream_closed = False
-        
-        # Track active listener languages for TTS
-        self._active_languages: Set[str] = set(target_languages)  # Start with all, Node will update
-        self._active_languages_lock = threading.Lock()
+        self._alive = True  # False when session is dead (audio writer stuck, canceled, etc.)
 
         # ── Validate inputs (fail loudly) ────────────────────────
         if not self.speech_key:
@@ -118,6 +115,9 @@ class TranslationSession:
         # Bounded thread pool for TTS: max 2 concurrent per session
         self._tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f'tts-{session_id}')
 
+        # Non-blocking audio queue: push_audio() never blocks Flask
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=200)
+
         self._log('info', 'init',
                   source=source_language,
                   targets=list(self.target_languages),
@@ -127,6 +127,12 @@ class TranslationSession:
 
         self._setup_recognizer()
         self._setup_synthesizers()
+
+        # Start background audio writer thread
+        self._audio_writer_thread = threading.Thread(
+            target=self._audio_writer, daemon=True,
+            name=f'audio-writer-{session_id}')
+        self._audio_writer_thread.start()
 
     # ── Logging helpers ─────────────────────────────────────────
 
@@ -255,27 +261,90 @@ class TranslationSession:
                   lifecycle_state='active',
                   note='Recognizer now listening continuously until stop() called')
 
+    @property
+    def alive(self):
+        """True if session is healthy. False if audio writer stuck, recognizer crashed, etc."""
+        return self._alive
+
     def push_audio(self, audio_bytes: bytes):
-        if self._stream_closed:
-            self._log('error', 'push_audio_after_close',
-                      bytes=len(audio_bytes),
-                      note='Attempting to push audio after stream closed')
-            return
+        """Non-blocking: puts audio in queue. Background writer does actual SDK write."""
+        if not self._alive or self._stream_closed:
+            return False
 
-        self._audio_stream.write(audio_bytes)
-        self._total_bytes_pushed += len(audio_bytes)
-        self._push_count += 1
+        try:
+            self._audio_queue.put_nowait(audio_bytes)
+            self._push_count += 1
 
-        # Log every 50th push to confirm audio data is flowing into the SDK
-        if self._push_count % 50 == 1:
-            total_sec = round(self._total_bytes_pushed / (16000 * 2), 1)
-            self._log('info', 'audio_pushed',
-                      push_no=self._push_count,
-                      chunk_bytes=len(audio_bytes),
-                      total_bytes=self._total_bytes_pushed,
-                      total_audio_seconds=total_sec,
-                      recognition_active=self._recognition_started and not self._recognition_stopped,
-                      stream_open=not self._stream_closed)
+            if self._push_count % 50 == 1:
+                self._log('info', 'audio_queued',
+                          push_no=self._push_count,
+                          chunk_bytes=len(audio_bytes),
+                          queue_size=self._audio_queue.qsize(),
+                          stream_open=not self._stream_closed)
+            return True
+        except queue.Full:
+            self._alive = False
+            self._log('error', 'audio_queue_full',
+                      queue_maxsize=self._audio_queue.maxsize,
+                      note='Audio writer blocked — marking session dead')
+            return False
+
+    def _audio_writer(self):
+        """Background thread: pulls from queue, writes to PushAudioInputStream."""
+        self._log('info', 'audio_writer_start')
+        while self._alive and not self._stream_closed and not self._stop_event.is_set():
+            try:
+                audio_bytes = self._audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if not self._alive or self._stream_closed:
+                break
+
+            try:
+                self._audio_stream.write(audio_bytes)
+                self._total_bytes_pushed += len(audio_bytes)
+
+                if self._total_bytes_pushed % (16000 * 2 * 5) < len(audio_bytes):
+                    total_sec = round(self._total_bytes_pushed / (16000 * 2), 1)
+                    self._log('info', 'audio_pushed',
+                              total_bytes=self._total_bytes_pushed,
+                              total_audio_seconds=total_sec,
+                              queue_depth=self._audio_queue.qsize())
+            except Exception as e:
+                self._alive = False
+                self._log('error', 'audio_write_error', error=str(e),
+                          note='SDK write failed — marking session dead')
+                break
+
+        self._log('info', 'audio_writer_exit',
+                  total_bytes=self._total_bytes_pushed,
+                  alive=self._alive)
+
+    def generate_tts(self, segment_id: str, translations: dict):
+        """
+        Queue TTS for explicit languages. Called by Node after segment_finalized.
+        No global active-language state — Node sends exactly which languages need TTS.
+        """
+        enqueued = []
+        for lang, text in translations.items():
+            if lang in self._translated_text_queues:
+                self._translated_text_queues[lang].put({
+                    'segment_id': segment_id,
+                    'text': text
+                })
+                enqueued.append(lang)
+            else:
+                self._log('warn', 'tts_queue_missing',
+                          language=lang, segment_id=segment_id,
+                          note=f'No TTS queue for {lang} — not in target_languages')
+
+        self._log('info', 'languages_enqueued_for_tts',
+                  segment_id=segment_id,
+                  languages_enqueued=enqueued,
+                  languages_requested=list(translations.keys()),
+                  enqueued_count=len(enqueued))
+        return enqueued
 
     def stop(self):
         """
@@ -288,9 +357,16 @@ class TranslationSession:
                   recognize_count=self._recognize_count,
                   lifecycle_state='stopping',
                   note='Explicit stop() called - ending session')
-        
+
+        # Mark dead first to unblock push_audio and audio writer
+        self._alive = False
+
         # Signal all threads to stop
         self._stop_event.set()
+
+        # Wait for audio writer to exit (checks _alive every 0.5s)
+        if self._audio_writer_thread.is_alive():
+            self._audio_writer_thread.join(timeout=2.0)
 
         # Stop TTS threads first
         for lang, info in self._synth_threads.items():
@@ -462,24 +538,13 @@ class TranslationSession:
                                       f"translations dict. Available: {translation_keys}. "
                                       f"Verify add_target_language('{trans_code}') was called."))
 
-                # Emit segment_finalized event immediately (don't wait for TTS)
-                self._emit_segment_finalized(
-                    segment_id=segment_id,
-                    source_text=source_text,
-                    translations=translations
-                )
-
-                # Queue TTS jobs only for active languages
-                with self._active_languages_lock:
-                    active_langs = self._active_languages.copy()
-                
-                for lang in active_langs:
-                    if lang in translations:
-                        # Queue with segment_id for tts_ready correlation
-                        self._translated_text_queues[lang].put({
-                            'segment_id': segment_id,
-                            'text': translations[lang]
-                        })
+                # Emit segment_finalized in daemon thread — NEVER block SDK callback
+                # Node will determine active languages and call /generate-tts
+                threading.Thread(
+                    target=self._emit_segment_finalized,
+                    args=(segment_id, source_text, translations),
+                    daemon=True
+                ).start()
 
             elif reason == speechsdk.ResultReason.RecognizedSpeech:
                 # RecognizedSpeech (not TranslatedSpeech) means Azure recognized
@@ -527,6 +592,7 @@ class TranslationSession:
                       error_details=cancellation.error_details if cancellation.error_details else '',
                       recognition_count=self._recognize_count,
                       note='CRITICAL: Recognition canceled - check error_details for root cause')
+            self._alive = False  # Mark dead so push_audio stops
             self._metric('errors_total')
             self._trace({
                 'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
@@ -553,6 +619,9 @@ class TranslationSession:
                               not self._stop_event.is_set() and 
                               not self._recognition_stopped)
             
+            if was_unexpected:
+                self._alive = False  # Mark dead so push_audio stops
+
             self._log('warn' if was_unexpected else 'info',
                       'azure_session_stopped',
                       lifecycle_event='session_stopped',
@@ -560,8 +629,9 @@ class TranslationSession:
                       stop_called=self._stop_event.is_set(),
                       recognition_stopped=self._recognition_stopped,
                       unexpected=was_unexpected,
-                      note=('UNEXPECTED session stop - recognition should be continuous' 
-                            if was_unexpected else 
+                      alive=self._alive,
+                      note=('UNEXPECTED session stop - recognition should be continuous'
+                            if was_unexpected else
                             'Normal session_stopped after explicit stop()'))
         except Exception as e:
             self._log('error', 'session_stopped_handler_exception',
@@ -820,16 +890,6 @@ class TranslationSession:
                       language=language, error=str(e))
             self._metric('errors_total')
     
-    def update_active_languages(self, active_languages: Set[str]):
-        """
-        Update the set of languages that have active listeners.
-        Only these languages will have TTS generated.
-        """
-        with self._active_languages_lock:
-            self._active_languages = active_languages
-            self._log('info', 'active_languages_updated',
-                      active_languages=list(active_languages))
-
     # ── Debug file saves ────────────────────────────────────────
 
     def _save_tts_debug(self, language, audio_bytes):

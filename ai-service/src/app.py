@@ -193,7 +193,13 @@ def process_audio():
                 'bytes': n_bytes
             })
 
-        session.push_audio(audio_bytes)
+        success = session.push_audio(audio_bytes)
+
+        if not success or not session.alive:
+            # Session died (audio writer stuck, recognizer crashed)
+            sessions.pop(session_id, None)
+            return jsonify({'error': 'Session expired or recognizer died',
+                            'code': 'SESSION_DEAD'}), 410
 
         return jsonify({'success': True, 'bytes': n_bytes, 'seqNo': seq_no})
 
@@ -203,49 +209,60 @@ def process_audio():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/update-active-languages', methods=['POST'])
-def update_active_languages():
+@app.route('/generate-tts', methods=['POST'])
+def generate_tts():
     """
-    Node notifies Python of which languages have active listeners.
-    Python will only generate TTS for these languages.
+    Node sends explicit translations to synthesize after receiving segment_finalized.
+    No global active-language state — Node decides which languages need TTS.
     """
     try:
         data = request.json
         session_id = data.get('sessionId')
-        active_languages = data.get('activeLanguages', [])
+        segment_id = data.get('segmentId')
+        translations = data.get('translations', {})
 
-        if not session_id:
-            return jsonify({'error': 'Missing sessionId'}), 400
+        if not session_id or not segment_id:
+            return jsonify({'error': 'Missing sessionId or segmentId'}), 400
+
+        if not translations:
+            return jsonify({'error': 'Empty translations — nothing to synthesize'}), 400
 
         session = sessions.get(session_id)
         if not session:
             return jsonify({'error': 'Session not found'}), 404
 
-        session.update_active_languages(set(active_languages))
-        
-        slog('info', 'active_languages_updated', 
-             session_id=session_id, 
-             active_languages=active_languages)
+        enqueued = session.generate_tts(segment_id, translations)
 
-        return jsonify({'success': True, 'activeLanguages': active_languages})
+        slog('info', 'generate_tts',
+             session_id=session_id,
+             segment_id=segment_id,
+             requested=list(translations.keys()),
+             enqueued=enqueued)
+
+        return jsonify({'success': True, 'segmentId': segment_id, 'enqueued': enqueued})
 
     except Exception as e:
         inc_metric('errors_total')
-        slog('error', 'update_active_languages_fail', error=str(e))
+        slog('error', 'generate_tts_fail', error=str(e))
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/end-session', methods=['POST'])
 def end_session():
+    """
+    End a translation session. Stops in background thread to return immediately.
+    """
     try:
         data = request.json
         session_id = data.get('sessionId')
         trace_id = data.get('traceId')
 
         if session_id in sessions:
-            sessions[session_id].stop()
-            del sessions[session_id]
-            slog('info', 'session_ended', session_id=session_id, trace_id=trace_id)
+            session = sessions.pop(session_id)
+            slog('info', 'session_ending', session_id=session_id, trace_id=trace_id,
+                 note='Stopping session in background thread')
+            # Stop in background — don't block the HTTP response
+            threading.Thread(target=session.stop, daemon=True).start()
 
         return jsonify({'success': True})
 

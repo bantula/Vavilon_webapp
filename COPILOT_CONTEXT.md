@@ -85,9 +85,9 @@ Resource group: `vavilon-rg`
 │         "translations": { "es": "Hola", "fr": "Bonjour", ... },            │
 │         "timestamp": "<ISO8601>"                                            │
 │       }                                                                     │
-│    D. Queue TTS jobs for ACTIVE languages only (languages with listeners)   │
-│       - Uses bounded ThreadPoolExecutor (max_workers=2 per session)         │
-│       - If no listeners for a language, TTS skipped                         │
+│    D. Emit segment_finalized ONLY — NO TTS queuing in callback             │
+│       - Callback fires in daemon thread (non-blocking)                      │
+│       - TTS decision is made by Node, not Python                            │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -95,14 +95,19 @@ Resource group: `vavilon-rg`
 │    A. Parse translations dict                                               │
 │    B. Broadcast subtitles IMMEDIATELY to all listeners:                     │
 │       WebSocket → { type: "subtitle", payload: { text, language } }        │
-│    C. Do NOT wait for TTS — subtitles appear instantly                      │
+│    C. Compute active languages from live WebSocket connections              │
+│    D. Filter translations to active languages only                          │
+│    E. POST /generate-tts to Python with { segmentId, translations }        │
+│    F. Set up TTS guard timer (10s) to detect missing TTS                    │
+│    G. Do NOT wait for TTS — subtitles appear instantly                      │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      ↓ (async, in parallel)
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 6. Python TTS threads synthesize audio per active language:                │
-│    A. Pull from per-language queue: { segment_id, text }                   │
-│    B. Call SpeechSynthesizer (SDK) or REST API (fallback)                  │
-│    C. When synthesis completes, emit tts_ready event to Node:              │
+│ 6. Python TTS threads synthesize audio per requested language:             │
+│    A. Receive explicit {lang: text} from Node via /generate-tts            │
+│    B. Queue into per-language TTS queues                                    │
+│    C. TTS worker pulls from queue, calls SpeechSynthesizer or REST API     │
+│    D. When synthesis completes, emit tts_ready event to Node:              │
 │       POST /api/events                                                      │
 │       {                                                                     │
 │         "type": "tts_ready",                                                │
@@ -134,10 +139,11 @@ Resource group: `vavilon-rg`
    - `tts_ready` → audio broadcast when ready (may be seconds later)
    - Listeners receive subtitles first, audio follows
 
-4. **Active Language Optimization**: 
-   - Node tracks which languages have active listeners
-   - Node sends `POST /update-active-languages` to Python
-   - Python only generates TTS for languages with listeners
+4. **Explicit TTS Per Segment (No Global State)**:
+   - Node computes active languages from live WebSocket connections at segment time
+   - Node sends `POST /generate-tts` with explicit `{lang: text}` per segment
+   - Python has NO mutable active-language state — receives exactly what to synthesize
+   - No race condition between listener join/leave and TTS generation
    - Saves compute and network bandwidth
 
 5. **Bounded Concurrency**:
@@ -150,13 +156,14 @@ Resource group: `vavilon-rg`
    - If TTS is slow, subtitles still appear immediately
    - Session remains alive even if TTS crashes
 
-### Active Language Tracking
+### Active Language Resolution (Per-Segment, Stateless)
 
-Node.js maintains `sessionActiveLanguages: Map<sessionId, Set<language>>`:
-- Updated when listener joins (`listener_join`)
-- Updated when listener disconnects (`handleDisconnect`)
-- Sent to Python via `POST /update-active-languages` whenever changed
-- Python uses this to filter TTS queue: only active languages get synthesis
+Node.js computes active languages **at the moment each segment is finalized**:
+- `getSessionListenerLanguages(sessionId)` scans the live `connections` Map
+- Returns a `Set<language>` of languages with at least one connected listener
+- Node filters translations to only active languages and sends `POST /generate-tts`
+- **No persistent state** — no `sessionActiveLanguages` Map, no sync endpoint
+- **No race condition** — languages are resolved at request time, not cached
 
 ### Event Schemas
 
@@ -191,11 +198,15 @@ Node.js maintains `sessionActiveLanguages: Map<sessionId, Set<language>>`:
 }
 ```
 
-#### update_active_languages (Node → Python)
+#### generate-tts (Node → Python)
 ```json
 {
   "sessionId": "test-session-abc123",
-  "activeLanguages": ["es", "fr"]
+  "segmentId": "660e8400-e29b-41d4-a716-446655440111",
+  "translations": {
+    "es": "Hola a todos",
+    "fr": "Bonjour tout le monde"
+  }
 }
 ```
 
@@ -206,7 +217,8 @@ Node.js maintains `sessionActiveLanguages: Map<sessionId, Set<language>>`:
 {
   "_translation_recognizer": TranslationRecognizer,  # One per session
   "_audio_stream": PushAudioInputStream,              # Open for session lifetime
-  "_active_languages": Set[str],                      # Updated by Node
+  "_audio_queue": queue.Queue(maxsize=200),           # Non-blocking audio buffer
+  "_alive": bool,                                     # False = session dead
   "_translated_text_queues": Dict[str, Queue],        # Per-language TTS queue
   "_tts_executor": ThreadPoolExecutor(max_workers=2), # Bounded TTS pool
   "_synth_threads": Dict[str, dict],                  # Per-language workers
@@ -232,6 +244,7 @@ Node.js maintains `sessionActiveLanguages: Map<sessionId, Set<language>>`:
 
 | Resource | Limit | Enforcement | Rationale |
 |----------|-------|-------------|-----------|
+| Audio queue per session | 200 chunks | queue.Queue(maxsize=200) | Non-blocking push_audio, session dies on overflow |
 | TTS threads per session | 2 | ThreadPoolExecutor(max_workers=2) | Prevent thread explosion |
 | TTS queue per language | Unbounded | queue.Queue() | Natural backpressure from recognition rate |
 | Active sessions | Unbounded | In-memory sessions dict | MVP - horizontal scaling later |
@@ -243,9 +256,10 @@ Node.js maintains `sessionActiveLanguages: Map<sessionId, Set<language>>`:
 |---------|--------|----------|
 | TTS fails for one language | Other languages continue, subtitles still appear | Logged, session alive |
 | Recognition callback exception | Caught, recognizer continues | try/except wrapper in all callbacks |
-| /process-audio 404 | Audio dispatch failures tracked | After 5 consecutive → session degraded |
+| /process-audio 410 (SESSION_DEAD) | Audio queue full or recognizer crashed | Speaker notified, must restart |
 | Python session crash | Translation stops, bypass continues | Speaker must restart |
-| Node → Python /update-active-languages timeout | TTS for all languages | Fire-and-forget, logged warning |
+| Node → Python /generate-tts timeout | TTS not synthesized for that segment | Fire-and-forget, TTS guard logs missing |
+| TTS guard timeout (10s) | Expected TTS not received | Logged as `missing_tts_for_active_language` |
 | /api/events endpoint down | Python logs errors, continues recognition | Subtitles/audio lost for that segment |
 
 ### Testing Locally
@@ -306,16 +320,16 @@ python debug/test_streaming_events.py
 | File | Purpose |
 |------|---------|
 | `backend/src/index.js` | Express server, CORS, health check, App Insights |
-| `backend/src/websocket/wsHandler.js` | WebSocket handler — speaker/listener connections, audio relay, active language tracking |
+| `backend/src/websocket/wsHandler.js` | WebSocket handler — speaker/listener connections, audio relay, getSessionListenerLanguages |
 | `backend/src/routes/sessions.js` | REST API for session CRUD |
 | `backend/src/routes/broadcast.js` | POST /api/broadcast — legacy endpoint (deprecated) |
-| `backend/src/routes/events.js` | **POST /api/events** — receives segment_finalized and tts_ready events from AI |
+| `backend/src/routes/events.js` | **POST /api/events** — receives segment_finalized and tts_ready events from AI, triggers /generate-tts, TTS guard |
 | `backend/src/services/sessionService.js` | Redis-backed session management, join codes, listener tracking |
 
 ### AI Service (Python)
 | File | Purpose |
 |------|---------|
-| `ai-service/src/app.py` | Flask server with `/start-session`, `/process-audio`, `/update-active-languages`, `/end-session` |
+| `ai-service/src/app.py` | Flask server with `/start-session`, `/process-audio`, `/generate-tts`, `/end-session` |
 | `ai-service/src/speech_service.py` | `TranslationSession` class — Azure SDK continuous recognition, event emission, async TTS |
 | `ai-service/Dockerfile` | Python 3.9-bullseye container with Azure Speech SDK system deps (libssl1.1) |
 | `ai-service/requirements.txt` | flask, flask-cors, azure-cognitiveservices-speech, requests, python-dotenv |
@@ -357,8 +371,8 @@ python debug/test_streaming_events.py
 | Endpoint | Body | When |
 |----------|------|------|
 | `POST /start-session` | `{ sessionId, traceId, sourceLanguage, targetLanguages }` | Speaker starts |
-| `POST /process-audio` | `{ sessionId, traceId, seqNo, audioData }` (base64) | Each audio chunk (non-blocking) |
-| `POST /update-active-languages` | `{ sessionId, activeLanguages }` | When listener joins/leaves |
+| `POST /process-audio` | `{ sessionId, traceId, seqNo, audioData }` (base64) | Each audio chunk (non-blocking queue) |
+| `POST /generate-tts` | `{ sessionId, segmentId, translations: {lang: text} }` | After segment_finalized (Node decides languages) |
 | `POST /end-session` | `{ sessionId, traceId }` | Speaker stops |
 
 ### AI Service → Backend (HTTP)
@@ -592,8 +606,9 @@ class TranslationSession:
         self._recognizer.start_continuous_recognition_async().get()
     
     def push_audio(self, audio_bytes):
-        # Stream audio continuously — do NOT close stream here
-        self._audio_stream.write(audio_bytes)
+        # Non-blocking: puts audio in queue, background writer does SDK write
+        # Returns False if session dead or queue full
+        self._audio_queue.put_nowait(audio_bytes)
     
     def _on_recognized(self, evt):
         # Process each recognized sentence
@@ -922,15 +937,13 @@ Browser → WebSocket audio_chunk → Node.js handleAudioChunk()
 ```
 There is exactly ONE code path. No legacy fallback. No binary message alternative.
 
-**Changes Applied**:
-1. ✅ **Removed silent 404 suppression** — ALL errors from `/process-audio` are now logged with full context (status, response body, seq_no, trace_id)
-2. ✅ **Session health degradation tracking** — `sessionHealth` Map tracks consecutive errors per session. After 5 consecutive failures, session is marked `degraded`.
-3. ✅ **Speaker notification** — When session degrades, speaker receives WebSocket message `{ type: 'error', payload: { code: 'SESSION_DEGRADED', message: '...' } }`
-4. ✅ **Degraded dispatch skip** — Once degraded, audio dispatch is skipped (no tight retry loop). Logged once every 200 chunks for visibility.
-5. ✅ **Health reset on start/stop/disconnect** — `sessionHealth.delete()` called when speaker starts, stops, or disconnects.
-6. ✅ **Binary message logging** — `handleBinaryMessage()` now logs a warning when raw binary audio is received (non-JSON path).
-7. ✅ **GET /routes endpoint on Python** — Returns all registered Flask routes for quick verification.
-8. ✅ **Integration test** — `debug/test_no_404.py` sends 5 simulated utterances, asserts zero 404s, checks trace events.
+**Changes Applied** (partially superseded by "Active Language Sync" fix):
+1. ✅ **Removed silent 404 suppression** — ALL errors from `/process-audio` are now logged
+2. ~~✅ **Session health degradation tracking**~~ — Removed in "Active Language Sync" fix. Replaced by Python-side `_alive` flag + HTTP 410.
+3. ✅ **Speaker notification** — On 410 SESSION_DEAD, speaker receives `{ type: 'error', payload: { code: 'SESSION_DEAD' } }`
+4. ✅ **Binary message logging** — `handleBinaryMessage()` now logs a warning when raw binary audio is received
+5. ✅ **GET /routes endpoint on Python** — Returns all registered Flask routes for quick verification
+6. ✅ **Integration test** — `debug/test_no_404.py` sends 5 simulated utterances, asserts zero 404s
 
 **Files Modified**:
 - `backend/src/websocket/wsHandler.js` — Rewrote `forwardAudioToAI()`, added `sessionHealth` Map, enhanced `handleBinaryMessage()`
@@ -953,6 +966,51 @@ python debug/test_no_404.py http://localhost:5000
 #    - audio_dispatch (every 50th chunk)
 #    - NO audio_dispatch_fail entries
 #    - NO session_degraded entries
+```
+
+---
+
+### ✅ Active Language Sync + Non-Blocking Audio — FIXED (Feb 15, 2026)
+**Status**: Root cause identified and architecture redesigned
+**Branch**: `fix/tts-active-language-sync`
+
+**Symptoms**:
+- Listener joins for Italian, but Italian TTS never generated
+- `/update-active-languages` returns 404 (session doesn't exist yet when listener joins before speaker starts)
+- `/process-audio` blocks when Azure SDK audio buffer fills (recognizer crashed or callback blocked by sync HTTP)
+
+**Root Causes**:
+1. **Active language sync broken**: Node sent `POST /update-active-languages` to Python, got 404 because listener joins before Python session exists (timing issue). Active languages never sync'd.
+2. **Blocking SDK callback**: `_emit_segment_finalized` did synchronous HTTP POST inside Azure SDK `_on_recognized` callback, blocking the recognizer thread → audio buffer fills → `PushAudioInputStream.write()` blocks → Flask hangs.
+3. **Mutable shared state**: `_active_languages` Set in Python had race condition with Node's tracking.
+
+**Fix — Explicit TTS Per Segment (Option 1)**:
+- **Removed** `/update-active-languages` endpoint, `_active_languages` mutable state in Python
+- **Added** `POST /generate-tts` endpoint — Node sends explicit `{segmentId, translations: {lang: text}}`
+- **Node decides** which languages need TTS at segment time (scans live connections)
+- **No sync needed** — languages resolved on-demand, not cached
+- **Non-blocking audio queue** — `push_audio()` uses `queue.Queue(maxsize=200)` with `put_nowait()`, background `_audio_writer` thread does actual SDK write
+- **Non-blocking callbacks** — `_emit_segment_finalized` fires in daemon thread
+- **Session health** — `_alive` flag set False on recognizer crash/canceled/queue overflow; HTTP 410 returned
+- **TTS guard** — Node sets 10s timeout per segment; logs `missing_tts_for_active_language` if expected TTS not received
+
+**Files Modified**:
+- `ai-service/src/speech_service.py` — Non-blocking audio queue, removed active_languages, added generate_tts()
+- `ai-service/src/app.py` — `/generate-tts` replaces `/update-active-languages`, 410 on dead session
+- `backend/src/websocket/wsHandler.js` — Removed sessionHealth/sessionActiveLanguages/updateSessionActiveLanguages, added getSessionListenerLanguages()
+- `backend/src/routes/events.js` — After segment_finalized: computes active languages, sends POST /generate-tts, TTS guard timer
+
+**Data Flow After Fix**:
+```
+Browser mic → WebSocket audio_chunk → Node
+  → POST /process-audio → Python push_audio() [non-blocking queue]
+    → audio_writer thread → PushAudioInputStream → Azure SDK
+      → _on_recognized callback [NO blocking I/O]
+        → daemon thread: POST /api/events {segment_finalized}
+          → Node: broadcast subtitles + POST /generate-tts {lang→text}
+            → Python: queue TTS for exactly those languages
+              → TTS thread: synthesize → POST /api/events {tts_ready}
+                → Node: broadcast audio to listeners
 ```
 
 ---
