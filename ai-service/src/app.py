@@ -9,7 +9,10 @@ import traceback
 import uuid
 from collections import deque
 from dotenv import load_dotenv
-from speech_service import TranslationSession
+try:
+    from speech_service import TranslationSession
+except ImportError:
+    from src.speech_service import TranslationSession
 
 load_dotenv()
 
