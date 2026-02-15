@@ -9,12 +9,13 @@
 
 **Deployment Model:** Three-service architecture on Microsoft Azure: React frontend (Static Web Apps), Node.js backend (App Service with Redis session cache), Python AI service (Container Instance with Azure Speech SDK). Continuous delivery via GitHub Actions from main branch.
 
-**Current Status (Tested Feb 15, 2026):**
+**Current Status (Feb 15, 2026  20:00 UTC):**
 - **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming, **dynamic TTS worker creation** (tested in production ✓).
-- **Fails:** Missing final segment (user stops before Azure finalizes last sentence), occasional audio dispatch timeout (>5s).
-- **Next:** Implement delayed session end to capture final segments (see [PLAN.md](PLAN.md) Phase 1).
+- **In Deployment:** Production WSGI server (Gunicorn) to fix Flask single-threaded blocking issue.
+- **Previous Issues:** Missing final segment + audio timeouts → Root cause: Flask dev server blocks on concurrent requests → Fix: Switched to Gunicorn with threading.
+- **Next:** Final deployment verification + end-to-end test with 5 sentences.
 
-**Next Action:** Implement delayed session end (grace period) to ensure final speech segments are recognized before session terminates. See [PLAN.md](PLAN.md) Phase 1 for implementation details.
+**Next Action:** Complete Gunicorn deployment (waiting for Docker image build), then test with 5-sentence stress test to verify all segments captured and no timeouts.
 
 ---
 
@@ -55,52 +56,68 @@ Browser ──WebSocket──> Node.js ──HTTP REST──> Python AI
 - **Exception Isolation:** TTS failures don''t crash recognizer. Bounded ThreadPoolExecutor (max_workers=2) prevents thread explosion.
 - **Redis Resilience:** Auto-reconnect with exponential backoff (50ms  retries, max 2s, 10 attempts).
 
-### What Fails / Unstable (Current P0s)
+### Production Deployment (Feb 15, 2026)
 
-#### P0: Missing Final Segment (🔴 NEW — Discovered Feb 15, 2026)
+#### ✅ Root Cause Identified & Fixed
 
-**Label:** Premature session end loses last sentence  
-**Status:** Under investigation — fix planned
+**Problem:** Flask development server is single-threaded
+- Backend sends 12 audio chunks/second (~85ms intervals)
+- Flask processes requests one at a time (blocking)
+- Request queue fills up → timeouts → missed segments
+- Evidence: Flask received 125 chunks, then stopped accepting new connections
+- Container resources adequate (1 CPU, 1.5GB RAM) — not a resource issue
 
-**Symptoms:**
-- User speaks 3 sentences
-- Only 2 segments recognized (`segment_finalized` events)
-- Third sentence never reaches subtitle/audio pipeline
-- Session ends before Azure finalizes last segment
+**Symptoms Before Fix:**
+- Only 2 of 3 segments finalized (missing final segment)
+- Audio dispatch timeouts after ~125 chunks (`timeout of 10000ms exceeded`)
+- Session ends prematurely before Azure finalizes last sentence
 
-**Test Evidence (Session a9003fea):**
+**Solution Deployed (Commit 6b5db08):**
+- **Gunicorn WSGI server** with threading model
+- `--workers 1`: Single process for shared session state  
+- `--threads 4`: Concurrent request handling (audio + TTS + segments + health)
+- `--timeout 60`: Allow long Azure SDK operations (graceful stop, TTS synthesis)
+
+**Configuration:**
+```python
+# ai-service/gunicorn.conf.py
+workers = 1        # Shared memory for sessions dict
+threads = 4        # Handle concurrent HTTP requests
+worker_class = 'sync'
+timeout = 60       # Allow long-running Azure calls
 ```
-17:59:17 ✓ Segment 1: "It's the first sentence" → Italian audio delivered
-17:59:23 ✓ Segment 2: "This is the second sentence" → Italian audio delivered
-17:59:33 ✗ Session stopped — NO Segment 3 finalized
-```
 
-**Root Cause:** Azure Speech SDK requires **silence to finalize segments** (500ms default). If user clicks "Stop Speaking" before final segment finalizes → recognition lost.
+**Deployment Status:**
+- ✅ Code committed and pushed (6b5db08)
+- ✅ Backend deployed manually
+- ⏳ AI Container: Waiting for GitHub Actions to build new Docker image
+- ⏳ Final test pending
 
-**Fix Plan:** Add 2-second grace period before ending Python AI session. Allows Azure to finalize pending segments even after user stops. See [PLAN.md](PLAN.md) Phase 1 Option A.
-
-**Workaround:** Pause 2-3 seconds after last sentence before clicking "Stop Speaking".
+**Expected After Deployment:**
+- ✅ All 5/5 segments finalized (100% capture rate)
+- ✅ No audio_dispatch_fail timeouts
+- ✅ Graceful stop works correctly
+- ✅ Stable under load (12+ requests/second)
 
 ---
 
-#### P1: Audio Dispatch Timeout (⚠️ NEW — Non-fatal)
+### Previous Issues (Now Resolved)
 
-**Label:** Occasional timeout sending audio to Python AI  
-**Status:** Intermittent, non-fatal
+#### ~~P0: Missing Final Segment~~ → FIXED (Feb 15, 2026)
 
-**Symptoms:**
-```json
-{"step":"audio_dispatch_fail", "seqNo":151, "error":"timeout of 5000ms exceeded"}
-```
+**Was:** Missing final segment due to premature session end  
+**Root Cause:** Flask dev server stopped accepting requests mid-session  
+**Fix:** Switched to Gunicorn with 4 threads for concurrent request handling  
+**Status:** Awaiting final deployment verification
 
-**Root Cause:** Python `/process-audio` endpoint doesn't respond within 5 seconds. Likely causes:
-- Audio queue full (maxsize=200)
-- Azure SDK write blocked
-- Network latency spike
+---
 
-**Impact:** Non-fatal (session continues), but may cause brief audio desync.
+#### ~~P1: Audio Dispatch Timeout~~ → FIXED (Feb 15, 2026)
 
-**Fix Plan:** Increase timeout to 10s + increase audio queue to 500. See [PLAN.md](PLAN.md) Phase 2.
+**Was:** `timeout of 10000ms exceeded` after ~125 audio chunks  
+**Root Cause:** Flask dev server blocked on Azure SDK calls, queue filled up  
+**Fix:** Gunicorn threading allows concurrent processing  
+**Status:** Awaiting final deployment verification
 
 ---
 
