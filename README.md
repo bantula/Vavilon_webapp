@@ -9,13 +9,13 @@
 
 **Deployment Model:** Three-service architecture on Microsoft Azure: React frontend (Static Web Apps), Node.js backend (App Service with Redis session cache), Python AI service (Container Instance with Azure Speech SDK). Continuous delivery via GitHub Actions from main branch.
 
-**Current Status (Feb 15, 2026  20:00 UTC):**
-- **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming, **dynamic TTS worker creation** (tested in production ✓).
-- **In Deployment:** Production WSGI server (Gunicorn) to fix Flask single-threaded blocking issue.
-- **Previous Issues:** Missing final segment + audio timeouts → Root cause: Flask dev server blocks on concurrent requests → Fix: Switched to Gunicorn with threading.
-- **Next:** Final deployment verification + end-to-end test with 5 sentences.
+**Current Status (Feb 15, 2026  21:30 UTC):**
+- **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming, Gunicorn production WSGI server (deployed & healthy).
+- **Fixed:** Gunicorn deployment (CrashLoopBackOff resolved), Flask single-threaded blocking.
+- **Bug Found & Fixed:** TTS audio never plays — `ThreadPoolExecutor(max_workers=2)` starved all but 2 language workers. Fix: `max_workers=len(target_languages)`.
+- **Next:** Deploy TTS fix, end-to-end test (speak 5 sentences, verify audio plays for all listeners).
 
-**Next Action:** Complete Gunicorn deployment (waiting for Docker image build), then test with 5-sentence stress test to verify all segments captured and no timeouts.
+**Next Action:** Push TTS thread pool fix, wait for GitHub Actions Docker build, restart Azure container, verify audio plays.
 
 ---
 
@@ -53,7 +53,7 @@ Browser ──WebSocket──> Node.js ──HTTP REST──> Python AI
 - **Bypass Mode:** Same-language listeners receive raw PCM wrapped in WAV headers (no translation). Latency <200ms. Bandwidth ~43KB/sec per listener.
 - **Audio Streaming:** Browser captures Float32 PCM at 44.1kHz, downsamples to Int16 16kHz, base64-encodes, sends via WebSocket as JSON. Python pushes to Azure PushAudioInputStream.
 - **Non-blocking Recognition:** Audio queue (maxsize=200) + background writer thread. Flask `/process-audio` returns immediately. Recognition runs on daemon threads.
-- **Exception Isolation:** TTS failures don''t crash recognizer. Bounded ThreadPoolExecutor (max_workers=2) prevents thread explosion.
+- **Exception Isolation:** TTS failures don''t crash recognizer. ThreadPoolExecutor sized per session (one thread per target language).
 - **Redis Resilience:** Auto-reconnect with exponential backoff (50ms  retries, max 2s, 10 attempts).
 
 ### Production Deployment (Feb 15, 2026)
@@ -88,16 +88,10 @@ timeout = 60       # Allow long-running Azure calls
 ```
 
 **Deployment Status:**
-- ✅ Code committed and pushed (6b5db08)
+- ✅ Gunicorn deployed and running (commit 6b5db08 + CrashLoopBackOff fix ce3930f)
+- ✅ Health endpoints responding, all routes registered
 - ✅ Backend deployed manually
-- ⏳ AI Container: Waiting for GitHub Actions to build new Docker image
-- ⏳ Final test pending
-
-**Expected After Deployment:**
-- ✅ All 5/5 segments finalized (100% capture rate)
-- ✅ No audio_dispatch_fail timeouts
-- ✅ Graceful stop works correctly
-- ✅ Stable under load (12+ requests/second)
+- ⏳ TTS thread pool fix pending deployment
 
 ---
 
@@ -315,7 +309,7 @@ az container logs --name vavilon-ai --resource-group vavilon-rg | Select-String 
 
 **Resource Limits:**
 - Audio queue: 200 chunks per session (non-blocking). Session dies on overflow.
-- TTS threads: 2 concurrent per session (ThreadPoolExecutor). Prevents resource exhaustion.
+- TTS threads: One per target language per session (ThreadPoolExecutor). Sized dynamically.
 - TTS queue per language: Unbounded (backpressure from recognition rate).
 - Recognition: One TranslationRecognizer per session. Continuous mode until explicit stop.
 

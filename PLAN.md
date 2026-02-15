@@ -5,6 +5,67 @@
 
 ---
 
+## Deployment Status (Updated: February 15, 2026 20:55 UTC)
+
+### ✅ ALL STEPS COMPLETED
+
+- [x] Root cause identified: Flask single-threaded blocking
+- [x] Solution designed: Gunicorn with workers=1, threads=4
+- [x] Code implemented: `gunicorn.conf.py`, `Dockerfile`, `requirements.txt`
+- [x] Git commit: `6b5db08` - "feat: switch to gunicorn with threading for production readiness"
+- [x] Pushed to GitHub main branch
+- [x] GitHub Actions Docker build completed successfully
+- [x] Backend deployed with graceful stop code
+- [x] **Fixed CrashLoopBackOff**: Added `src/__init__.py` + import fallback in `app.py` (commit `ce3930f`)
+- [x] **Container recreated**: Deleted stuck container, recreated with `az container create`
+- [x] **Gunicorn running**: Logs confirm `Starting gunicorn 22.0.0`, worker `gthread`, pid 23
+- [x] **Health endpoint responding**: `http://vavilon-ai.westeurope.azurecontainer.io:5000/health` returns OK
+- [x] **All routes registered**: `/generate-tts`, `/process-audio`, `/start-session`, `/end-session` all present
+- [x] **Backend healthy**: `https://vavilon-backend.azurewebsites.net/health` returns OK
+
+### Previous Issue: CrashLoopBackOff (Exit Code 3) - RESOLVED
+- **Root cause**: Gunicorn imports app as `src.app:app` (package-style), but `app.py` had bare `from speech_service import TranslationSession` which only works with direct `python src/app.py` execution
+- **Fix**: Added `ai-service/src/__init__.py` + `try/except ImportError` fallback in `app.py`
+- **Container was in CrashLoopBackOff** with 22+ starts and kills, exit code 3 (worker boot failure)
+- **Resolution**: Deleted stuck container, pushed fix, rebuilt image, recreated container
+
+### NEW: TTS Audio Never Plays — ThreadPoolExecutor Starvation (Feb 15, 2026 21:30 UTC)
+
+**Symptom:** Subtitles work perfectly, but no audio ever plays for any listener.
+
+**Root Cause:** `speech_service.py` line 116 had `ThreadPoolExecutor(max_workers=2)`, but `_setup_synthesizers()` submits infinite-loop TTS workers for ALL target languages (up to 9). Only the first 2 workers ever execute; the rest are queued forever in the executor's internal queue. Text enqueued for other languages is never consumed.
+
+**Evidence from container logs:**
+- Only `fr` and `ja` workers running (the first 2 submitted)
+- Italian text enqueued (`queue_depth` growing to 7) but never consumed
+- Zero `tts_synthesis_start` events in entire session
+- Workers for other languages start then immediately exit on session end (never ran)
+
+**Fix:** Changed `max_workers=2` to `max_workers=max(len(target_languages), 2)` so every language gets its own thread.
+
+**Deploy Steps:**
+1. Push to main (triggers GitHub Actions Docker build ~5 min)
+2. After build completes, restart container:
+   ```bash
+   az container restart --name vavilon-ai --resource-group vavilon-rg
+   ```
+3. Wait 30s, verify:
+   ```bash
+   az container logs --name vavilon-ai --resource-group vavilon-rg
+   # Should see: Starting gunicorn 22.0.0
+   curl http://vavilon-ai.westeurope.azurecontainer.io:5000/health
+   ```
+
+### Remaining: End-to-End Test
+- [ ] English speaker + Italian listener
+- [ ] Speak 5 sentences rapidly
+- [ ] Verify all 5 segments finalized with Italian TTS
+- [ ] Verify `tts_synthesis_start` events appear in logs (was zero before fix)
+- [ ] Verify no audio_dispatch_fail timeouts
+- [ ] Verify TTS guard logs show `tts_all_received` (not `missing_tts_for_active_language`)
+
+---
+
 ## Root Cause Analysis
 
 ### Problem Summary
@@ -180,12 +241,18 @@ gunicorn --workers 4 --bind 0.0.0.0:5000 src.app:app
 ✅ 4 threads for 1-5 concurrent sessions = large safety margin
 
 ### Testing Checklist
+- [x] Code changes committed and pushed
+- [x] GitHub Actions build completed
+- [x] New Docker image in ACR (SHA bb8936228d44...)
+- [ ] Container successfully restarted (BLOCKED: stuck in "Updating")
+- [ ] Gunicorn startup logs verified
+- [ ] Health endpoint responding
 - [ ] Segments 1-5 all finalized
 - [ ] No audio_dispatch_fail timeouts
 - [ ] Graceful stop logs present
 - [ ] TTS audio delivered for all segments
 - [ ] Container stable for 10+ minutes after test
-- [ ] Memory usage remains under 1GB (check `az container show`)
+- [ ] Memory usage remains under 1GB
 
 ---
 
@@ -229,14 +296,24 @@ az container create --resource-group vavilon-rg --name vavilon-ai-old --image va
 
 ## Timeline
 
-**Estimated Time:** 20 minutes total
-- Code changes: 5 min
-- Git commit/push: 1 min
-- GitHub Actions build: 5-8 min
-- Container restart: 1 min
-- End-to-end test: 3-5 min
+**Original Estimate:** 20 minutes total
 
-**Go/No-Go Decision Point:** After test in Step 4  
+**Actual Progress:**
+- ✅ Code changes: 5 min (completed)
+- ✅ Git commit/push: 1 min (completed)
+- ✅ GitHub Actions build: 8 min (completed at 20:20:51 UTC)
+- ⏳ Container restart: **7+ minutes and counting** (expected 1-2 min, currently stuck)
+- ⚠️ **BLOCKED:** Container deployment issue preventing testing
+
+**Current Status:** Deployment phase blocked due to container stuck in "Updating" state.
+
+**Time Spent So Far:** ~15 minutes (code) + 8 minutes (build) + 7+ minutes (waiting) = 30+ minutes
+
+**Estimated Remaining Time:**
+- If container issue resolves: 5-10 min (verification + testing)
+- If need to recreate container: 15-20 min (delete + recreate + verify + test)
+
+**Go/No-Go Decision Point:** After container successfully restarts  
 **Success Criteria:** All 5 segments received + no timeouts
 
 ---
@@ -256,16 +333,72 @@ A: Then we'd need `--workers 4 --threads 8` (32 concurrent requests) + increase 
 
 ## Next Steps
 
-**Ready to proceed?**
-1. Review this plan
-2. Confirm threading approach (vs workers)
-3. Execute Step 1-4
-4. Report test results
+### Immediate Actions Required
 
-**Alternatively:** Test locally first:
+**1. Resolve Container Deployment Issue**
+
+The container has been stuck in "Updating" state for 7+ minutes. Try one of these:
+
+**Option A: Wait and monitor**
 ```powershell
-cd ai-service
-pip install gunicorn
-gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 src.app:app
-# Test via http://localhost:5000/health
+# Check status every 2 minutes
+az container show --name vavilon-ai --resource-group vavilon-rg --query "{State:instanceView.state, ProvisioningState:provisioningState}" -o json
+```
+
+**Option B: Force delete and recreate** (if stuck for >15 min)
+```powershell
+# Delete stuck container
+az container delete --name vavilon-ai --resource-group vavilon-rg --yes
+
+# Recreate from latest image
+az container create \
+  --resource-group vavilon-rg \
+  --name vavilon-ai \
+  --image vavilonacr.azurecr.io/vavilon-ai:latest \
+  --registry-login-server vavilonacr.azurecr.io \
+  --registry-username <USERNAME> \
+  --registry-password <PASSWORD> \
+  --dns-name-label vavilon-ai \
+  --ports 5000 \
+  --cpu 1 \
+  --memory 1.5 \
+  --environment-variables \
+    SPEECH_KEY=<KEY> \
+    SPEECH_REGION=westeurope \
+    BACKEND_URL=https://vavilon-backend.azurewebsites.net
+```
+
+**Option C: Check Azure Portal**
+- Navigate to: Portal → Resource Groups → vavilon-rg → vavilon-ai
+- Check "Events" tab for detailed error messages
+- Check "Containers" tab for pull status
+
+**2. Once Container is Running**
+```powershell
+# Verify gunicorn startup
+az container logs --name vavilon-ai --resource-group vavilon-rg
+
+# Should see:
+# [INFO] Starting gunicorn 22.0.0
+# [INFO] Listening at: http://0.0.0.0:5000
+# [INFO] Using worker: sync
+# [INFO] Booting worker with pid: ###
+
+# Test health endpoint
+Invoke-WebRequest -Uri "http://vavilon-ai.westeurope.azurecontainer.io:5000/health"
+```
+
+**3. End-to-End Testing**
+- Navigate to: https://www.vavilonapp.rs
+- English speaker → Italian listener
+- Speak 5 sentences, stop immediately
+- Verify all 5 segments + no timeouts
+
+**4. Monitor Production**
+```powershell
+# Check container status after 10 minutes
+az container show --name vavilon-ai --resource-group vavilon-rg --query "instanceView"
+
+# Check memory usage
+az container show --name vavilon-ai --resource-group vavilon-rg --query "containers[0].instanceView.currentState.detailStatus"
 ```

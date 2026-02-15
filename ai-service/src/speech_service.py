@@ -112,8 +112,8 @@ class TranslationSession:
         self._translated_text_queues: Dict[str, queue.Queue] = {}
         self._synthesizers: Dict[str, speechsdk.SpeechSynthesizer] = {}
         self._synth_threads: Dict[str, dict] = {}
-        # Bounded thread pool for TTS: max 2 concurrent per session
-        self._tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f'tts-{session_id}')
+        # Thread pool for TTS: one thread per target language so all workers can run
+        self._tts_executor = ThreadPoolExecutor(max_workers=max(len(target_languages), 2), thread_name_prefix=f'tts-{session_id}')
         # Lock for thread-safe dynamic worker creation
         self._worker_lock = threading.Lock()
 
