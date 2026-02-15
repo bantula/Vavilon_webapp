@@ -327,23 +327,51 @@ class TranslationSession:
         No global active-language state — Node sends exactly which languages need TTS.
         """
         enqueued = []
+        
+        self._log('info', 'generate_tts_received',
+                  session_id=self.session_id,
+                  segment_id=segment_id,
+                  translations_count=len(translations),
+                  requested_languages=list(translations.keys()))
+        
         for lang, text in translations.items():
-            if lang in self._translated_text_queues:
+            if lang not in self._translated_text_queues:
+                self._log('warn', 'tts_language_not_init',
+                          session_id=self.session_id,
+                          language=lang,
+                          segment_id=segment_id,
+                          note='Language not in target_languages - skipping')
+                continue
+            
+            try:
+                queue_depth = self._translated_text_queues[lang].qsize()
                 self._translated_text_queues[lang].put({
                     'segment_id': segment_id,
                     'text': text
                 })
                 enqueued.append(lang)
-            else:
-                self._log('warn', 'tts_queue_missing',
-                          language=lang, segment_id=segment_id,
-                          note=f'No TTS queue for {lang} — not in target_languages')
-
-        self._log('info', 'languages_enqueued_for_tts',
+                
+                self._log('info', 'tts_enqueued',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
+                          language=lang,
+                          text_preview=text[:50],
+                          queue_depth_before=queue_depth,
+                          queue_depth_after=queue_depth + 1)
+            except Exception as e:
+                self._log('error', 'tts_enqueue_fail',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
+                          language=lang,
+                          error=str(e),
+                          traceback=traceback.format_exc())
+        
+        self._log('info', 'generate_tts_complete',
+                  session_id=self.session_id,
                   segment_id=segment_id,
-                  languages_enqueued=enqueued,
-                  languages_requested=list(translations.keys()),
-                  enqueued_count=len(enqueued))
+                  enqueued_count=len(enqueued),
+                  enqueued_languages=enqueued)
+        
         return enqueued
 
     def stop(self):
@@ -647,13 +675,32 @@ class TranslationSession:
         Catches ALL exceptions to prevent silent thread death.
         Supports SDK and REST API modes.
         """
+        thread_id = threading.get_ident()
         mode = 'rest' if self._use_rest_tts else 'sdk'
-        self._log('info', 'synth_thread_start',
+        
+        self._log('info', 'tts_worker_started',
+                  session_id=self.session_id,
                   language=language,
+                  thread_id=thread_id,
                   mode=mode,
                   thread_pool='bounded_executor')
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+        iteration_count = 0
 
         while self._synth_threads[language]["running"] and not self._stop_event.is_set():
+            iteration_count += 1
+            
+            # Log heartbeat every 10 iterations
+            if consecutive_errors == 0 and iteration_count % 10 == 0:
+                self._log('debug', 'tts_worker_alive',
+                          session_id=self.session_id,
+                          language=language,
+                          thread_id=thread_id,
+                          queue_depth=self._translated_text_queues[language].qsize(),
+                          iterations=iteration_count)
+            
             try:
                 # Reduced timeout for faster exit on stop
                 item = self._translated_text_queues[language].get(timeout=0.2)
@@ -676,10 +723,15 @@ class TranslationSession:
             try:
                 self._metric('tts_calls')
                 locale = self.TTS_LOCALE_MAP.get(language, 'unknown')
-                self._log('info', 'tts_start', language=language,
-                          mode=mode, tts_input_text=text[:60],
-                          tts_locale=locale,
+                
+                self._log('info', 'tts_synthesis_start',
+                          session_id=self.session_id,
                           segment_id=segment_id,
+                          language=language,
+                          mode=mode,
+                          text_length=len(text),
+                          text_preview=text[:50],
+                          tts_locale=locale,
                           note='Synthesizing TRANSLATED text (not English original)')
 
                 if self._use_rest_tts:
@@ -691,15 +743,25 @@ class TranslationSession:
                 self._latency('tts_latencies', elapsed_ms)
 
                 if not audio_bytes or len(audio_bytes) == 0:
-                    self._log('error', 'tts_empty', language=language,
-                              mode=mode, text=text[:60], elapsed_ms=elapsed_ms,
-                              segment_id=segment_id)
+                    self._log('error', 'tts_empty_audio',
+                              session_id=self.session_id,
+                              segment_id=segment_id,
+                              language=language,
+                              mode=mode,
+                              elapsed_ms=elapsed_ms,
+                              note='Synthesizer returned no audio data')
+                    consecutive_errors += 1
                     self._metric('errors_total')
                     continue
 
-                self._log('info', 'tts_done', language=language,
-                          mode=mode, bytes=len(audio_bytes),
-                          elapsed_ms=elapsed_ms, segment_id=segment_id)
+                self._log('info', 'tts_synthesis_complete',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
+                          language=language,
+                          mode=mode,
+                          audio_bytes=len(audio_bytes),
+                          duration_ms=elapsed_ms)
+                
                 self._trace({
                     'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                     'step': 'tts',
@@ -715,23 +777,53 @@ class TranslationSession:
 
                 audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
                 
-                # Emit tts_ready event instead of direct broadcast
-                self._emit_tts_ready(
-                    segment_id=segment_id,
-                    language=language,
-                    audio_b64=audio_b64
-                )
+                # Emit tts_ready event - may raise exception
+                try:
+                    self._emit_tts_ready(
+                        segment_id=segment_id,
+                        language=language,
+                        audio_b64=audio_b64
+                    )
+                    consecutive_errors = 0  # Reset on success
+                except Exception as emit_error:
+                    consecutive_errors += 1
+                    self._log('error', 'tts_emit_fail',
+                              session_id=self.session_id,
+                              segment_id=segment_id,
+                              language=language,
+                              error=str(emit_error),
+                              consecutive_errors=consecutive_errors,
+                              traceback=traceback.format_exc())
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        self._log('critical', 'tts_worker_giving_up',
+                                  session_id=self.session_id,
+                                  language=language,
+                                  note=f'Failed {max_consecutive_errors} times - stopping worker')
+                        break
 
             except Exception as e:
                 # CRITICAL: catch all so the thread never dies
                 # TTS failure for one language should NOT stop recognizer
-                self._log('error', 'tts_exception',
+                consecutive_errors += 1
+                self._log('error', 'tts_worker_exception',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
                           language=language,
                           mode=mode,
                           error=str(e),
+                          error_type=type(e).__name__,
+                          consecutive_errors=consecutive_errors,
                           traceback=traceback.format_exc(),
                           note='TTS failed for this language - recognizer continues for future utterances')
                 self._metric('errors_total')
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    self._log('critical', 'tts_worker_crashed',
+                              session_id=self.session_id,
+                              language=language,
+                              note=f'{max_consecutive_errors} consecutive errors - worker dead')
+                    break
             finally:
                 try:
                     self._translated_text_queues[language].task_done()
@@ -740,11 +832,15 @@ class TranslationSession:
 
         # Thread exiting - log the reason
         exit_reason = 'stop_event' if self._stop_event.is_set() else 'running_flag_cleared'
-        self._log('info', 'synth_thread_exit', 
+        self._log('info', 'tts_worker_stopped',
+                  session_id=self.session_id,
                   language=language,
+                  thread_id=thread_id,
                   exit_reason=exit_reason,
                   stop_event_set=self._stop_event.is_set(),
                   running_flag=self._synth_threads[language]["running"],
+                  consecutive_errors=consecutive_errors,
+                  total_iterations=iteration_count,
                   note='TTS thread exiting cleanly')
 
     def _sdk_tts(self, language, text):
@@ -845,50 +941,95 @@ class TranslationSession:
         """
         Emit tts_ready event when TTS synthesis completes.
         Node will broadcast audio to listeners of that language.
+        Implements retry logic for resilience.
         """
-        try:
-            event = {
-                'type': 'tts_ready',
-                'traceId': self.trace_id,
-                'sessionId': self.session_id,
-                'segmentId': segment_id,
-                'language': language,
-                'audioFormat': 'riff16khz16bitpcm',
-                'audioBytesBase64': audio_b64
-            }
-            
-            resp = requests.post(
-                f'{self.node_backend_url}/api/events',
-                json=event,
-                timeout=10
-            )
-            
-            self._log('info', 'tts_ready_sent',
-                      segment_id=segment_id,
-                      language=language,
-                      status=resp.status_code,
-                      b64_len=len(audio_b64))
-            self._trace({
-                'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-                'step': 'tts_ready',
-                'segment_id': segment_id,
-                'language': language,
-                'status': resp.status_code,
-                'b64_len': len(audio_b64)
-            })
-
-            if resp.status_code != 200:
-                self._log('error', 'tts_ready_rejected',
+        event = {
+            'type': 'tts_ready',
+            'traceId': self.trace_id,
+            'sessionId': self.session_id,
+            'segmentId': segment_id,
+            'language': language,
+            'audioFormat': 'riff16khz16bitpcm',
+            'audioBytesBase64': audio_b64
+        }
+        
+        url = f'{self.node_backend_url}/api/events'
+        max_retries = 2
+        retry_delay = 0.5
+        audio_size_kb = len(base64.b64decode(audio_b64)) / 1024
+        
+        for attempt in range(max_retries + 1):
+            try:
+                self._log('info', 'tts_emit_attempt',
+                          session_id=self.session_id,
                           segment_id=segment_id,
-                          language=language, status=resp.status_code,
-                          body=resp.text[:300])
-                self._metric('errors_total')
+                          language=language,
+                          attempt=attempt + 1,
+                          audio_size_kb=round(audio_size_kb, 2),
+                          url=url)
+                
+                resp = requests.post(url, json=event, timeout=5.0)
+                
+                self._log('info', 'tts_emit_success',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
+                          language=language,
+                          status_code=resp.status_code,
+                          attempt=attempt + 1,
+                          b64_len=len(audio_b64))
+                
+                self._trace({
+                    'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                    'step': 'tts_ready',
+                    'segment_id': segment_id,
+                    'language': language,
+                    'status': resp.status_code,
+                    'b64_len': len(audio_b64)
+                })
 
-        except Exception as e:
-            self._log('error', 'tts_ready_error',
-                      segment_id=segment_id,
-                      language=language, error=str(e))
-            self._metric('errors_total')
+                if resp.status_code != 200:
+                    self._log('error', 'tts_ready_rejected',
+                              session_id=self.session_id,
+                              segment_id=segment_id,
+                              language=language,
+                              status=resp.status_code,
+                              body=resp.text[:300])
+                    self._metric('errors_total')
+                
+                return  # Success
+            
+            except requests.exceptions.Timeout as e:
+                self._log('error', 'tts_emit_timeout',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
+                          language=language,
+                          attempt=attempt + 1,
+                          max_retries=max_retries,
+                          error=str(e))
+                
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+                else:
+                    self._metric('errors_total')
+            
+            except Exception as e:
+                self._log('error', 'tts_emit_error',
+                          session_id=self.session_id,
+                          segment_id=segment_id,
+                          language=language,
+                          attempt=attempt + 1,
+                          max_retries=max_retries,
+                          error=str(e),
+                          error_type=type(e).__name__,
+                          traceback=traceback.format_exc())
+                
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+                else:
+                    self._metric('errors_total')
+        
+        # All retries failed
+        raise Exception(f'Failed to emit tts_ready after {max_retries + 1} attempts')
     
     # ── Debug file saves ────────────────────────────────────────
 

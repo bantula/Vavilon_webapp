@@ -5,6 +5,8 @@ import json
 import time
 import base64
 import threading
+import traceback
+import uuid
 from collections import deque
 from dotenv import load_dotenv
 from speech_service import TranslationSession
@@ -215,36 +217,75 @@ def generate_tts():
     Node sends explicit translations to synthesize after receiving segment_finalized.
     No global active-language state — Node decides which languages need TTS.
     """
+    request_id = str(uuid.uuid4())[:8]
+    
     try:
         data = request.json
         session_id = data.get('sessionId')
         segment_id = data.get('segmentId')
         translations = data.get('translations', {})
-
+        
+        slog('info', 'generate_tts_request',
+             request_id=request_id,
+             session_id=session_id,
+             segment_id=segment_id,
+             translations_count=len(translations),
+             languages=list(translations.keys()))
+        
         if not session_id or not segment_id:
+            slog('error', 'generate_tts_bad_request',
+                 request_id=request_id,
+                 missing='sessionId' if not session_id else 'segmentId')
             return jsonify({'error': 'Missing sessionId or segmentId'}), 400
-
+        
         if not translations:
+            slog('warn', 'generate_tts_empty',
+                 request_id=request_id,
+                 session_id=session_id,
+                 segment_id=segment_id)
             return jsonify({'error': 'Empty translations — nothing to synthesize'}), 400
 
         session = sessions.get(session_id)
         if not session:
+            slog('error', 'generate_tts_session_not_found',
+                 request_id=request_id,
+                 session_id=session_id,
+                 segment_id=segment_id,
+                 active_sessions=list(sessions.keys()))
             return jsonify({'error': 'Session not found'}), 404
+        
+        if not session.alive:
+            slog('error', 'generate_tts_session_dead',
+                 request_id=request_id,
+                 session_id=session_id,
+                 segment_id=segment_id)
+            return jsonify({'error': 'Session is dead', 'code': 'SESSION_DEAD'}), 410
 
         enqueued = session.generate_tts(segment_id, translations)
-
-        slog('info', 'generate_tts',
+        
+        slog('info', 'generate_tts_success',
+             request_id=request_id,
              session_id=session_id,
              segment_id=segment_id,
-             requested=list(translations.keys()),
+             enqueued_count=len(enqueued),
              enqueued=enqueued)
-
-        return jsonify({'success': True, 'segmentId': segment_id, 'enqueued': enqueued})
+        
+        return jsonify({
+            'success': True,
+            'sessionId': session_id,
+            'segmentId': segment_id,
+            'enqueued': enqueued,
+            'requestId': request_id
+        })
 
     except Exception as e:
         inc_metric('errors_total')
-        slog('error', 'generate_tts_fail', error=str(e))
-        return jsonify({'error': str(e)}), 500
+        slog('error', 'generate_tts_exception',
+             request_id=request_id,
+             error=str(e),
+             error_type=type(e).__name__,
+             traceback=traceback.format_exc())
+        return jsonify({'error': str(e), 'requestId': request_id}), 500
 
 
 @app.route('/end-session', methods=['POST'])

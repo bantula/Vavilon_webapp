@@ -2,18 +2,40 @@ const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
 const redis = require('redis');
 
-// Redis client for session storage
+// Redis client for session storage with connection resilience
 const client = redis.createClient({
   url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
   password: process.env.REDIS_PASSWORD,
   socket: {
     tls: process.env.REDIS_URL ? true : false,
-    rejectUnauthorized: false
+    rejectUnauthorized: false,
+    reconnectStrategy: (retries) => {
+      if (retries > 10) {
+        console.error('Redis reconnect failed after 10 attempts');
+        return new Error('Redis reconnect limit exceeded');
+      }
+      const delay = Math.min(retries * 50, 2000);
+      console.log(`Redis reconnecting in ${delay}ms (attempt ${retries})`);
+      return delay;
+    }
   }
 });
 
-client.on('error', (err) => console.error('Redis Client Error', err));
-client.on('connect', () => console.log('✓ Connected to Redis'));
+client.on('error', (err) => {
+  console.error('Redis client error:', err);
+});
+
+client.on('reconnecting', () => {
+  console.warn('Redis client reconnecting...');
+});
+
+client.on('ready', () => {
+  console.log('✓ Redis client ready');
+});
+
+client.on('connect', () => {
+  console.log('✓ Connected to Redis');
+});
 
 // Connect to Redis
 (async () => {

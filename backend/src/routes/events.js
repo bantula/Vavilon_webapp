@@ -112,7 +112,8 @@ router.post('/', async (req, res) => {
           sessionId,
           expectedLanguages: new Set(ttsLanguagesRequested),
           received: new Set(),
-          timer: guardTimer
+          timer: guardTimer,
+          timestamp: Date.now()
         });
 
         // Fire-and-forget: don't block the event response
@@ -126,6 +127,15 @@ router.post('/', async (req, res) => {
               sessionId,
               segmentId,
               traceId,
+              url: `${AI_SERVICE_URL}/generate-tts`,
+              requestBody: {
+                sessionId,
+                segmentId,
+                translationsCount: Object.keys(ttsTranslations).length,
+                languages: Object.keys(ttsTranslations)
+              },
+              responseStatus: resp.status,
+              responseData: resp.data,
               enqueued: resp.data.enqueued
             });
           })
@@ -134,7 +144,9 @@ router.post('/', async (req, res) => {
               sessionId,
               segmentId,
               traceId,
-              error: error.response?.data || error.message
+              error: error.response?.data || error.message,
+              errorStatus: error.response?.status,
+              errorCode: error.code
             });
           });
       }
@@ -157,17 +169,22 @@ router.post('/', async (req, res) => {
           error: 'Missing required fields for tts_ready'
         });
       }
+      
+      const audioSizeBytes = Buffer.from(audioBytesBase64, 'base64').length;
+      const pending = pendingTts.get(segmentId);
+      const timeSinceSegmentMs = pending ? Date.now() - pending.timestamp : null;
 
       slog('info', 'tts_ready_received', {
         sessionId,
         segmentId,
         traceId,
         language,
-        audioBytes: Buffer.from(audioBytesBase64, 'base64').length
+        audioBytes: audioSizeBytes,
+        audioSizeKB: (audioSizeBytes / 1024).toFixed(2),
+        timeSinceSegmentMs
       });
 
       // Update TTS guard tracking
-      const pending = pendingTts.get(segmentId);
       if (pending) {
         pending.received.add(language);
         // If all expected TTS received, clear the guard early
@@ -178,7 +195,8 @@ router.post('/', async (req, res) => {
             sessionId,
             segmentId,
             traceId,
-            languages: [...pending.received]
+            languages: [...pending.received],
+            totalTimeMs: Date.now() - pending.timestamp
           });
         }
       }
