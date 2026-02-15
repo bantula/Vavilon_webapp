@@ -9,12 +9,12 @@
 
 **Deployment Model:** Three-service architecture on Microsoft Azure: React frontend (Static Web Apps), Node.js backend (App Service with Redis session cache), Python AI service (Container Instance with Azure Speech SDK). Continuous delivery via GitHub Actions from main branch.
 
-**Current Status:**
-- **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming.
-- **Fixed (Pending Deploy):** Dynamic TTS worker creation implemented. Workers now spawn on-demand when new languages join mid-session.
-- **Testing Required:** Deploy to Azure and verify Italian listener joining mid-session receives audio.
+**Current Status (Tested Feb 15, 2026):**
+- **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming, **dynamic TTS worker creation** (tested in production ✓).
+- **Fails:** Missing final segment (user stops before Azure finalizes last sentence), occasional audio dispatch timeout (>5s).
+- **Next:** Implement delayed session end to capture final segments (see [PLAN.md](PLAN.md) Phase 1).
 
-**Next Action:** Deploy updated AI service to Azure Container Instance and test with dynamic listener join scenario (execute Phase 5 in [PLAN.md](PLAN.md)). Implementation complete: dynamic TTS worker creation now spawns threads on-demand for languages that join mid-session.
+**Next Action:** Implement delayed session end (grace period) to ensure final speech segments are recognized before session terminates. See [PLAN.md](PLAN.md) Phase 1 for implementation details.
 
 ---
 
@@ -43,11 +43,12 @@ Browser ──WebSocket──> Node.js ──HTTP REST──> Python AI
                     Azure Speech SDK
 ```
 
-### What Works (Verified)
+### What Works (Verified in Production)
 
-- **STT & Translation:** 9 languages (en, es, fr, de, it, pt, ru, zh, ja). Azure TranslationRecognizer continuous mode processes unlimited utterances.
+- **STT & Translation:** 9 languages (en, es, fr, de, it, pt, ru, zh, ja). Azure TranslationRecognizer continuous mode processes unlimited utterances. Tested Feb 15, 2026: English → Italian translation working perfectly.
 - **Subtitle Broadcast:** Instant delivery (<500ms) after recognition. Node queries Redis for active listeners, broadcasts translated text via WebSocket.
 - **Session Lifecycle:** Speaker creates session, listeners join via 6-char code. Redis stores state. `/start-session`, `/process-audio`, `/end-session` endpoints stable.
+- **Dynamic TTS Workers:** **✅ TESTED & WORKING** — Workers spawn on-demand when listeners join mid-session. Italian listener joined after session start, TTS worker created dynamically, audio delivered successfully (125-367ms latency). No `missing_tts_for_active_language` errors.
 - **Bypass Mode:** Same-language listeners receive raw PCM wrapped in WAV headers (no translation). Latency <200ms. Bandwidth ~43KB/sec per listener.
 - **Audio Streaming:** Browser captures Float32 PCM at 44.1kHz, downsamples to Int16 16kHz, base64-encodes, sends via WebSocket as JSON. Python pushes to Azure PushAudioInputStream.
 - **Non-blocking Recognition:** Audio queue (maxsize=200) + background writer thread. Flask `/process-audio` returns immediately. Recognition runs on daemon threads.
@@ -56,29 +57,70 @@ Browser ──WebSocket──> Node.js ──HTTP REST──> Python AI
 
 ### What Fails / Unstable (Current P0s)
 
-#### P0: TTS Delivery Failure → No Audio Generated (✅ FIXED)
+#### P0: Missing Final Segment (🔴 NEW — Discovered Feb 15, 2026)
+
+**Label:** Premature session end loses last sentence  
+**Status:** Under investigation — fix planned
+
+**Symptoms:**
+- User speaks 3 sentences
+- Only 2 segments recognized (`segment_finalized` events)
+- Third sentence never reaches subtitle/audio pipeline
+- Session ends before Azure finalizes last segment
+
+**Test Evidence (Session a9003fea):**
+```
+17:59:17 ✓ Segment 1: "It's the first sentence" → Italian audio delivered
+17:59:23 ✓ Segment 2: "This is the second sentence" → Italian audio delivered
+17:59:33 ✗ Session stopped — NO Segment 3 finalized
+```
+
+**Root Cause:** Azure Speech SDK requires **silence to finalize segments** (500ms default). If user clicks "Stop Speaking" before final segment finalizes → recognition lost.
+
+**Fix Plan:** Add 2-second grace period before ending Python AI session. Allows Azure to finalize pending segments even after user stops. See [PLAN.md](PLAN.md) Phase 1 Option A.
+
+**Workaround:** Pause 2-3 seconds after last sentence before clicking "Stop Speaking".
+
+---
+
+#### P1: Audio Dispatch Timeout (⚠️ NEW — Non-fatal)
+
+**Label:** Occasional timeout sending audio to Python AI  
+**Status:** Intermittent, non-fatal
+
+**Symptoms:**
+```json
+{"step":"audio_dispatch_fail", "seqNo":151, "error":"timeout of 5000ms exceeded"}
+```
+
+**Root Cause:** Python `/process-audio` endpoint doesn't respond within 5 seconds. Likely causes:
+- Audio queue full (maxsize=200)
+- Azure SDK write blocked
+- Network latency spike
+
+**Impact:** Non-fatal (session continues), but may cause brief audio desync.
+
+**Fix Plan:** Increase timeout to 10s + increase audio queue to 500. See [PLAN.md](PLAN.md) Phase 2.
+
+---
+
+#### ✅ FIXED: TTS Delivery Failure (Deployed & Tested Feb 15, 2026)
 
 **Label:** TTS worker thread lifecycle bug  
-**Status:** Fixed, pending deployment and testing
+**Status:** ✅ **WORKING IN PRODUCTION**
 
-**Root Cause:** TTS worker threads initialized ONCE at session start based on initial listener languages. Italian listener joined later; no Italian worker thread exists to process queue. Only German/Spanish workers visible in logs (from earlier test). Enqueued jobs sit in queue forever.
+**What Was Broken:** TTS worker threads created once at session start. New languages joining mid-session had no worker → no audio.
 
-**Fix Implemented:**
-- Added `_ensure_tts_worker()` method in `speech_service.py`
-- Dynamically creates queue, synthesizer, and worker thread for new languages
-- Thread-safe with lock + double-check pattern to prevent race conditions
-- `generate_tts()` now calls `_ensure_tts_worker()` before enqueuing TTS
-- Workers spawn on-demand when listeners join mid-session
+**Fix:** Dynamic worker creation — `_ensure_tts_worker()` spawns threads on-demand.
 
-**Testing Plan:**
-1. Start speaker session (source: English)
-2. Join as listener (target: German)
-3. Speak 1 sentence → verify German audio works
-4. Join second listener (target: Italian) mid-session
-5. Speak 2 more sentences → verify Italian audio delivered
-6. Check logs: `dynamic_worker_created` for Italian language
+**Test Results:**
+- Italian listener joined mid-session ✓
+- Dynamic worker created automatically ✓
+- TTS synthesis: 125-367ms (excellent) ✓
+- Audio delivered for all segments ✓
+- No `missing_tts_for_active_language` errors ✓
 
-**Implementation Details:** See [PLAN.md](PLAN.md) Implementation Complete section.
+**Commit:** 640a5ad
 
 ---
 

@@ -252,19 +252,22 @@ async function handleStopSpeaking(connectionId) {
     sessionId: conn.sessionId,
     traceId: conn.traceId,
     totalChunks: conn.seqNo,
-    note: 'Ending session (fire-and-forget)'
+    note: 'Ending session with graceful stop (close stream, wait for final segments)'
   });
 
   // Fire-and-forget: don't await the /end-session call
   // This prevents blocking if the Python service is slow or times out
+  // graceful=true: Close stream first, wait for Azure to finalize pending segments
   axios.post(`${AI_SERVICE_URL}/end-session`, {
     sessionId: conn.sessionId,
-    traceId: conn.traceId
-  }, { timeout: 5000 })
+    traceId: conn.traceId,
+    graceful: true  // Close stream first to ensure final segments are processed
+  }, { timeout: 8000 })  // Increased timeout to accommodate graceful stop (2s grace period)
     .then(() => {
       slog('info', 'node', 'ai_session_ended', {
         sessionId: conn.sessionId,
-        traceId: conn.traceId
+        traceId: conn.traceId,
+        graceful: true
       });
     })
     .catch((error) => {
@@ -327,7 +330,7 @@ async function forwardAudioToAI(connectionId, sessionId, audioData, conn) {
     await axios.post(`${AI_SERVICE_URL}/process-audio`, {
       sessionId, traceId, seqNo,
       audioData: base64Audio
-    }, { timeout: 5000 });
+    }, { timeout: 10000 });  // Increased from 5000ms to 10000ms (Phase 2 fix)
   } catch (error) {
     const status = error.response?.status;
 

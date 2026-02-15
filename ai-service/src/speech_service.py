@@ -118,7 +118,7 @@ class TranslationSession:
         self._worker_lock = threading.Lock()
 
         # Non-blocking audio queue: push_audio() never blocks Flask
-        self._audio_queue: queue.Queue = queue.Queue(maxsize=200)
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=500)  # Increased from 200 to 500 (Phase 2 fix)
 
         self._log('info', 'init',
                   source=source_language,
@@ -443,23 +443,54 @@ class TranslationSession:
         
         return enqueued
 
-    def stop(self):
+    def stop(self, graceful=False):
         """
         Stop the translation session.
         Uses timeouts to prevent blocking indefinitely.
         Returns quickly even if cleanup isn't complete.
+        
+        Args:
+            graceful: If True, closes stream first and waits for pending segments
+                     before stopping recognizer. If False, stops immediately.
         """
         self._log('info', 'stopping',
                   total_bytes=self._total_bytes_pushed,
                   recognize_count=self._recognize_count,
                   lifecycle_state='stopping',
-                  note='Explicit stop() called - ending session')
+                  graceful=graceful,
+                  note='Graceful stop (close stream first)' if graceful else 'Explicit stop() called - ending session')
 
         # Mark dead first to unblock push_audio and audio writer
         self._alive = False
 
         # Signal all threads to stop
         self._stop_event.set()
+
+        # GRACEFUL STOP: Close stream first to signal end-of-input to Azure
+        # This allows Azure to finalize any pending segments
+        if graceful and not self._stream_closed:
+            try:
+                self._log('info', 'graceful_stop_closing_stream',
+                          note='Closing audio stream to signal end-of-input to Azure')
+                self._audio_stream.close()
+                self._stream_closed = True
+                self._log('info', 'graceful_stop_stream_closed',
+                          note='Stream closed - Azure will finalize pending segments')
+                
+                # Wait for Azure to finalize pending segments
+                # Azure continuous recognition will emit final segment_finalized 
+                # events after stream close. Typical time: 200-800ms.
+                grace_period_sec = 2.0
+                self._log('info', 'graceful_stop_waiting',
+                          wait_seconds=grace_period_sec,
+                          note='Waiting for Azure to finalize pending segments')
+                time.sleep(grace_period_sec)
+                self._log('info', 'graceful_stop_wait_complete',
+                          note='Grace period complete - proceeding with recognizer stop')
+            except Exception as e:
+                self._log('error', 'graceful_stop_stream_close_fail', 
+                          error=str(e),
+                          note='Stream close failed - continuing with normal stop')
 
         # Wait for audio writer to exit (checks _alive every 0.5s)
         if self._audio_writer_thread.is_alive():
@@ -510,7 +541,7 @@ class TranslationSession:
                 self._log('error', 'stop_recognizer_fail', error=str(e),
                           note='Recognizer stop failed but continuing cleanup')
 
-        # Close audio stream
+        # Close audio stream (if not already closed in graceful stop)
         if not self._stream_closed:
             try:
                 self._log('info', 'closing_audio_stream')

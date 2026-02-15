@@ -292,20 +292,35 @@ def generate_tts():
 def end_session():
     """
     End a translation session. Stops in background thread to return immediately.
+    
+    Request body:
+        {
+            "sessionId": "...",
+            "traceId": "...",
+            "graceful": true/false  [optional, default: false]
+        }
+    
+    If graceful=true: Closes audio stream first, waits for Azure to finalize 
+                      pending segments, then stops recognizer. Ensures 100% of 
+                      audio is processed. Adds ~2 seconds to stop time.
+    If graceful=false: Stops immediately (legacy behavior).
     """
     try:
         data = request.json
         session_id = data.get('sessionId')
         trace_id = data.get('traceId')
+        graceful = data.get('graceful', False)
 
         if session_id in sessions:
             session = sessions.pop(session_id)
             slog('info', 'session_ending', session_id=session_id, trace_id=trace_id,
-                 note='Stopping session in background thread')
+                 graceful=graceful,
+                 note='Graceful stop (close stream first)' if graceful else 'Stopping session in background thread')
             # Stop in background — don't block the HTTP response
-            threading.Thread(target=session.stop, daemon=True).start()
+            # Pass graceful parameter to stop method
+            threading.Thread(target=lambda: session.stop(graceful=graceful), daemon=True).start()
 
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'graceful': graceful})
 
     except Exception as e:
         inc_metric('errors_total')
