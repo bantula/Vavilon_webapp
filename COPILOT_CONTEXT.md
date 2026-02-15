@@ -1451,4 +1451,34 @@ Auto-deploys via GitHub Actions when pushed to main (Static Web Apps).
 3. Identify exact failure point from structured logs
 4. Apply Phase 3+ fixes based on evidence
 
+### February 15, 2026 - EMERGENCY HOTFIX: TypeError in TTS (Commit 6e08c46)
+**Deployed**: 16:30 UTC  
+**Status**: ✅ Successfully deployed to production  
+**Branch**: `main`  
+**Priority**: P0 - Production Breaking Bug  
+**Focus**: Fix TypeError caused by duplicate session_id kwargs in TTS logging
+
+**Root Cause**: Commit 7a107ac (diagnostic improvements) introduced duplicate kwargs. The `_log()` wrapper automatically adds `session_id=self.session_id`, but new logging calls also passed it explicitly, causing Python TypeError: "got multiple values for keyword argument 'session_id'"
+
+**Impact**: 100% TTS failure - all translation sessions could produce subtitles but no audio was generated or delivered
+
+**Changes Deployed**:
+- Removed duplicate `session_id=self.session_id` from 20 logging calls in `TranslationSession` class
+- Methods fixed: `generate_tts()`, `_voice_synth()`, `_emit_tts_ready()`
+- Updated PLAN.md with hotfix documentation
+
+**Files Modified**:
+- `ai-service/src/speech_service.py` - Removed duplicate session_id kwargs from all logging calls
+- `PLAN.md` - Documented hotfix strategy
+
+**Deployment Verification**:
+```bash
+# AI Container restarted: 16:30 UTC
+# State: Running
+# Logs show: {"step":"startup", "port":5000, "azure_configured":true}
+# No TypeError exceptions on startup
+```
+
+**Testing Required**: Create speaker session, join as Italian listener, speak 3 sentences, verify subtitles AND audio for all sentences
+
 ---
