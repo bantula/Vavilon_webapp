@@ -1,320 +1,322 @@
-# Vavilon - Real-Time Translation Web App
+﻿# Vavilon DOO  Real-Time Translation Platform
+**Documentation Date:** February 15, 2026
 
-A production-ready MVP for real-time spoken translation for tours, museums, and conferences. One speaker broadcasts to multiple listeners, each receiving translations in their chosen language with audio and live subtitles.
+---
 
-## Architecture
+## Executive Summary
+
+**Vavilon** is a real-time spoken translation web app for tours, museums, and conferences. One speaker broadcasts to multiple listeners; each listener receives live translated speech and subtitles in their chosen language. Web-only, no app installation required. Target capacity: 200 concurrent listeners across 10 languages.
+
+**Deployment Model:** Three-service architecture on Microsoft Azure: React frontend (Static Web Apps), Node.js backend (App Service with Redis session cache), Python AI service (Container Instance with Azure Speech SDK). Continuous delivery via GitHub Actions from main branch.
+
+**Current Status:**
+- **Works:** STT and translation (9 languages), subtitle broadcast, session lifecycle, Redis persistence, same-language bypass (sub-200ms latency), WebSocket streaming.
+- **Fails:** TTS audio delivery completely non-functional. Italian listener receives subtitles but no audio. Node requests TTS from Python (200 OK response), but Python never synthesizes or emits audio.
+
+**Next Action:** Execute [PLAN.md](PLAN.md) Phase 1-3 to add dynamic TTS worker thread creation when new languages join mid-session (currently workers only created at session start).
+
+---
+
+## Technical README
+
+### Overview
+
+**Architecture:** Event-driven broadcast system with three services:
+- **Frontend** (React/Vite)  Mic capture (16kHz PCM), WebSocket streaming, audio playback queue
+- **Backend** (Node.js/Express)  WebSocket hub, session orchestration, Redis-backed state
+- **AI Service** (Python/Flask)  Azure Speech SDK continuous recognition, translation, TTS synthesis
+
+**Event-Driven Principle:** Recognition never blocks. Subtitles broadcast instantly on `segment_finalized`. Audio follows async via separate `tts_ready` events when synthesis completes. Each service runs independently; failures in one don''t crash others.
+
+**Single Source of Truth:** Redis stores all session state (listeners, languages, join codes). Node queries Redis for active listeners at segment time; no mutable caching.
+
+### Architecture Diagram (Text)
 
 ```
-Speaker (Browser)
-    ↓ Audio Stream (WebSocket)
-Node.js Backend (Port 3000)
-    ↓ Audio forwarding
-Python AI Service (Port 5000)
-    ↓ Azure Speech SDK
-    - STT (once per speaker)
-    - Translation (once per language)
-    - TTS (once per language)
-    ↓
-Node.js Backend
-    ↓ Broadcast (WebSocket)
-Listeners (Browsers, 200+)
+Browser ──WebSocket──> Node.js ──HTTP REST──> Python AI
+(React)  <──────────── Express+WS <─────────  Flask+Azure SDK
+ 5173                   3000                   5000
+                          |
+                        Redis (Session storage)
+                          |
+                    Azure Speech SDK
 ```
 
-## Features
+### What Works (Verified)
 
-- **One-to-Many Broadcasting**: Single speaker, unlimited listeners
-- **Real-Time Translation**: Audio + live subtitles in 10 languages
-- **Session Management**: Simple 6-character join codes + QR codes
-- **WebSocket Streaming**: Low-latency audio and subtitle delivery
-- **Azure-Powered AI**: Speech-to-Text, Translation, Text-to-Speech
-- **No Authentication**: Quick join, no signup required
+- **STT & Translation:** 9 languages (en, es, fr, de, it, pt, ru, zh, ja). Azure TranslationRecognizer continuous mode processes unlimited utterances.
+- **Subtitle Broadcast:** Instant delivery (<500ms) after recognition. Node queries Redis for active listeners, broadcasts translated text via WebSocket.
+- **Session Lifecycle:** Speaker creates session, listeners join via 6-char code. Redis stores state. `/start-session`, `/process-audio`, `/end-session` endpoints stable.
+- **Bypass Mode:** Same-language listeners receive raw PCM wrapped in WAV headers (no translation). Latency <200ms. Bandwidth ~43KB/sec per listener.
+- **Audio Streaming:** Browser captures Float32 PCM at 44.1kHz, downsamples to Int16 16kHz, base64-encodes, sends via WebSocket as JSON. Python pushes to Azure PushAudioInputStream.
+- **Non-blocking Recognition:** Audio queue (maxsize=200) + background writer thread. Flask `/process-audio` returns immediately. Recognition runs on daemon threads.
+- **Exception Isolation:** TTS failures don''t crash recognizer. Bounded ThreadPoolExecutor (max_workers=2) prevents thread explosion.
+- **Redis Resilience:** Auto-reconnect with exponential backoff (50ms  retries, max 2s, 10 attempts).
 
-## Tech Stack
+### What Fails / Unstable (Current P0s)
 
-### Backend (Node.js)
-- Express.js - HTTP API
-- ws - WebSocket server
-- Session management + QR code generation
-- Audio stream fan-out to listeners
+#### P0: TTS Delivery Failure  No Audio Generated
 
-### AI Service (Python)
-- Flask - REST API
-- Azure Cognitive Services Speech SDK
-- STT → Translation → TTS pipeline
+**Label:** TTS worker thread lifecycle bug  
+**Symptoms:**
+- Subtitles appear correctly (translation works)
+- Zero audio delivered to listeners
+- Node sends `POST /generate-tts`  Python returns 200 OK with `{"enqueued":["it"]}`
+- Node waits 10s, logs `missing_tts_for_active_language` timeout
+- Python logs show TTS enqueued but NO synthesis activity
 
-### Frontend (React)
-- Vite - Build tool
-- React Router - Navigation
-- WebSocket client - Real-time communication
-- MediaRecorder API - Microphone capture
-
-## Prerequisites
-
-- Node.js 18+ and npm
-- Python 3.9+
-- Azure account with Speech Service resource
-
-## Setup
-
-### 1. Clone and Install
-
+**Reproduction:**
 ```bash
-# Install root dependencies
-npm install
-
-# Install all workspace dependencies
-cd backend && npm install && cd ..
-cd frontend && npm install && cd ..
-cd ai-service && pip install -r requirements.txt && cd ..
+1. Start speaker session (source: English)
+2. Join as listener (target: Italian)
+3. Speak 3 sentences
+4. Observe: Subtitles appear , audio never plays 
+5. Check logs: Node shows tts_languages_requested:["it"], generate_tts_sent
+6. Python logs: tts_enqueued for Italian, but no tts_worker_alive for Italian
 ```
 
-### 2. Azure Setup
+**Root Cause:** TTS worker threads initialized ONCE at session start based on initial listener languages. Italian listener joined later; no Italian worker thread exists to process queue. Only German/Spanish workers visible in logs (from earlier test). Enqueued jobs sit in queue forever.
 
-1. Go to [Azure Portal](https://portal.azure.com)
-2. Create a **Speech Service** resource
-3. Copy the **Key** and **Region** (e.g., `eastus`)
+**Immediate Mitigation:** Restart session with Italian listener BEFORE speaker starts talking (so `target_languages` includes Italian at session creation).
 
-### 3. Environment Configuration
+**Permanent Fix:** Implement dynamic worker creation in `generate_tts()` method. Check if worker thread exists for language; if not, spawn new thread on-demand. See [PLAN.md](PLAN.md) Phase 4 Option A.
 
-Create `.env` files from examples:
+**Investigation Status:** See [PLAN.md](PLAN.md) for comprehensive investigation and fix strategy across 5 phases.
 
+---
+
+### Key Endpoints & APIs
+
+**Node Backend REST:**
+```http
+POST /api/events
+Content-Type: application/json
+
+# segment_finalized (from Python)
+{
+  "type": "segment_finalized",
+  "sessionId": "abc123",
+  "segmentId": "uuid",
+  "translations": {"es": "Hola", "it": "Ciao"}
+}
+
+# tts_ready (from Python)
+{
+  "type": "tts_ready",
+  "sessionId": "abc123",
+  "segmentId": "uuid",
+  "language": "it",
+  "audioFormat": "riff16khz16bitpcm",
+  "audioBytesBase64": "UklGRiQAAA..."
+}
+```
+
+**Python AI REST:**
+```http
+POST /start-session
+{
+  "sessionId": "abc123",
+  "traceId": "uuid",
+  "sourceLanguage": "en-US",
+  "targetLanguages": ["es", "it"]
+}
+
+POST /process-audio
+{
+  "sessionId": "abc123",
+  "traceId": "uuid",
+  "seqNo": 42,
+  "audioData": "base64-encoded-pcm"
+}
+
+POST /generate-tts
+{
+  "sessionId": "abc123",
+  "segmentId": "uuid",
+  "translations": {"it": "Ciao mondo"}
+}
+```
+
+**WebSocket Messages (Browser  Node):**
+```json
+// Speaker  Backend
+{"type": "audio_chunk", "payload": {"audioData": "base64..."}}
+
+// Backend  Listener
+{"type": "subtitle", "payload": {"text": "Ciao", "language": "it"}}
+{"type": "audio", "payload": {"audioData": "base64...", "language": "it"}}
+{"type": "bypass_audio", "payload": {"audioData": "base64..."}}
+```
+
+---
+
+### Deployment & Debugging Quick Commands
+
+**Deploy Backend (Node):**
+```powershell
+cd backend
+python -c "import zipfile,os;z=zipfile.ZipFile(''deploy.zip'',''w'');[z.write(r+''/''+f) for r,d,fs in os.walk(''src'') for f in fs];[z.write(x) for x in [''package.json'',''package-lock.json'']];z.close()"
+az webapp deployment source config-zip --resource-group vavilon-rg --name vavilon-backend --src deploy.zip
+```
+
+**Deploy AI Service (Python):**
+```powershell
+cd ai-service
+az acr build --registry vavilonacr --image vavilon-ai:latest .
+az container restart --resource-group vavilon-rg --name vavilon-ai
+```
+
+**Required Environment Variables (AI Container):**
 ```bash
-# Backend
-cp backend/.env.example backend/.env
-# Edit: Set AI_SERVICE_URL if needed
-
-# AI Service
-cp ai-service/.env.example ai-service/.env
-# Edit: Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION
-```
-
-**ai-service/.env:**
-```env
 PORT=5000
-NODE_BACKEND_URL=http://localhost:3000
-AZURE_SPEECH_KEY=your_actual_key_here
-AZURE_SPEECH_REGION=eastus
+AZURE_SPEECH_KEY=<your-key>
+AZURE_SPEECH_REGION=westeurope
+NODE_BACKEND_URL=https://vavilon-backend.azurewebsites.net
 ```
 
-### 4. Run Development Servers
+**View Container Logs:**
+```powershell
+az container logs --name vavilon-ai --resource-group vavilon-rg
+```
 
-**Option A: Run all services together (recommended)**
+**View Backend Logs:**
+```powershell
+az webapp log tail --name vavilon-backend --resource-group vavilon-rg
+```
+
+**Debug TTS Pipeline:**
+```powershell
+# Check if TTS enqueued
+az container logs --name vavilon-ai --resource-group vavilon-rg | Select-String "tts_enqueued"
+
+# Check which workers alive
+az container logs --name vavilon-ai --resource-group vavilon-rg | Select-String "tts_worker_alive"
+
+# Check for missing TTS timeouts
+az webapp log tail --name vavilon-backend --resource-group vavilon-rg | Select-String "missing_tts"
+```
+
+**Test TTS Endpoint Directly:**
 ```bash
-npm run dev
+curl -X POST http://vavilon-ai.westeurope.azurecontainer.io:5000/generate-tts \
+  -H "Content-Type: application/json" \
+  -d ''{
+    "sessionId": "test-abc123",
+    "segmentId": "seg-uuid",
+    "translations": {"it": "Questa è una prova"}
+  }''
 ```
 
-**Option B: Run separately**
+**Health Check:**
 ```bash
-# Terminal 1: Backend
-cd backend && npm run dev
-
-# Terminal 2: AI Service
-cd ai-service && npm run dev
-
-# Terminal 3: Frontend
-cd frontend && npm run dev
+curl http://vavilon-ai.westeurope.azurecontainer.io:5000/health
+curl https://vavilon-backend.azurewebsites.net/health
 ```
 
-### 5. Access the App
+---
 
-Open browser: **http://localhost:5173**
+### Testing Checklist
 
-## Usage
+**End-to-End Validation:**
+```bash
+# 1. Start services locally
+cd ai-service && python src/app.py &          # port 5000
+cd backend && npm start &                     # port 3000
+cd frontend && npm run dev &                  # port 5173
 
-### As Speaker:
-1. Click "Start a Tour"
-2. Share the 6-character code or QR code
-3. Click "Start Speaking"
-4. Speak into your microphone
-5. Listeners receive translations in real-time
+# 2. Run event flow test
+python debug/test_streaming_events.py         # Validates segment_finalized + tts_ready
 
-### As Listener:
-1. Click "Join a Tour"
-2. Enter session code
-3. Select your language
-4. Click "Join Session"
-5. Hear translated audio + see live subtitles
-
-## Project Structure
-
-```
-vavilon_webapp/
-├── backend/                 # Node.js server
-│   ├── src/
-│   │   ├── index.js        # Express + WebSocket setup
-│   │   ├── routes/
-│   │   │   ├── sessions.js # Session CRUD API
-│   │   │   └── broadcast.js # Translation broadcast
-│   │   ├── services/
-│   │   │   └── sessionService.js # Session management
-│   │   └── websocket/
-│   │       └── wsHandler.js # WebSocket logic
-│   └── package.json
-│
-├── ai-service/              # Python AI service
-│   ├── src/
-│   │   ├── app.py          # Flask API
-│   │   └── speech_service.py # Azure Speech SDK
-│   └── requirements.txt
-│
-├── frontend/                # React frontend
-│   ├── src/
-│   │   ├── pages/
-│   │   │   ├── LandingPage.jsx
-│   │   │   ├── SpeakerPage.jsx
-│   │   │   └── ListenerPage.jsx
-│   │   ├── App.jsx
-│   │   └── main.jsx
-│   └── package.json
-│
-└── package.json             # Root workspace config
+# 3. Browser test
+1. Open http://localhost:5173
+2. Click "Start Session" (creates speaker session)
+3. Select source language: English
+4. Open incognito tab  Join listener (enter 6-char code)
+5. Select target language: Italian
+6. Return to speaker tab  Click "Start Speaking"
+7. Speak 3 clear sentences in English
+8. Verify:
+    Italian subtitles appear after each sentence (2-3s delay)
+    Italian audio plays after subtitles (known failure Feb 15)
+    Console logs show WebSocket messages
+    No error toasts
+9. Check backend logs: segment_finalized_received, tts_ready_received
+10. Check AI logs: generate_tts_received, tts_enqueued, tts_synthesis_complete
 ```
 
-## API Endpoints
+**TTS Worker Verification (Debug Current Bug):**
+```bash
+# After step 7 above, immediately check:
+az container logs --name vavilon-ai --resource-group vavilon-rg | Select-String "tts_worker" | Select-Object -Last 20
 
-### Backend (Node.js)
-
-**Sessions**
-- `POST /api/sessions` - Create new session
-- `GET /api/sessions/:idOrCode` - Get session details
-- `GET /api/sessions/:id/stats` - Get listener statistics
-- `DELETE /api/sessions/:id` - End session
-
-**Broadcasting**
-- `POST /api/broadcast` - Broadcast translations to listeners
-
-**WebSocket**
-- `ws://localhost:3000/ws` - WebSocket connection
-  - `speaker_join` - Speaker joins session
-  - `listener_join` - Listener joins session
-  - `audio_chunk` - Speaker sends audio
-  - `audio` - Listener receives audio
-  - `subtitle` - Listener receives subtitles
-
-### AI Service (Python)
-
-- `POST /process-audio` - Process speaker audio (STT + Translation + TTS)
-- `POST /start-session` - Initialize translation session
-- `POST /end-session` - End translation session
-- `GET /health` - Health check
-
-## Supported Languages
-
-- English (en)
-- Spanish (es)
-- French (fr)
-- German (de)
-- Italian (it)
-- Portuguese (pt)
-- Russian (ru)
-- Chinese (zh)
-- Japanese (ja)
-- Arabic (ar)
-
-## Data Flow
-
-1. **Speaker speaks** → Microphone captures audio
-2. **Audio chunks** → Sent via WebSocket to Node.js backend
-3. **Forward to AI** → Node.js forwards to Python service
-4. **STT** → Python: Speech-to-Text (once)
-5. **Translation** → Python: Translate to all target languages (once per language)
-6. **TTS** → Python: Text-to-Speech for each language (once per language)
-7. **Broadcast** → Node.js broadcasts audio + subtitles per language
-8. **Listeners receive** → Audio plays + subtitles display
-
-## Production Deployment
-
-### Azure Recommendations:
-
-1. **Backend**: Azure App Service (Node.js)
-2. **AI Service**: Azure Container Instance (Python)
-3. **Frontend**: Azure Static Web Apps
-4. **Database**: Azure Redis Cache (session storage)
-5. **Speech**: Azure Cognitive Services (already required)
-
-### Environment Variables (Production):
-
-```env
-# Backend
-PORT=3000
-AI_SERVICE_URL=https://your-ai-service.azurecontainer.io
-FRONTEND_URL=https://your-frontend.azurestaticapps.net
-
-# AI Service
-PORT=5000
-NODE_BACKEND_URL=https://your-backend.azurewebsites.net
-AZURE_SPEECH_KEY=<production-key>
-AZURE_SPEECH_REGION=<region>
+# Expected (BROKEN): Only de/es workers, no "it" worker
+# Expected (FIXED): tts_worker_alive for language="it"
 ```
 
-### Scaling Considerations:
+---
 
-- **Session Storage**: Replace in-memory Map with Redis
-- **WebSocket Scaling**: Use Azure SignalR Service
-- **AI Service**: Scale horizontally with container orchestration
-- **CDN**: Use Azure CDN for frontend assets
+### Operational Notes
 
-## Known Limitations (MVP)
+**Resource Limits:**
+- Audio queue: 200 chunks per session (non-blocking). Session dies on overflow.
+- TTS threads: 2 concurrent per session (ThreadPoolExecutor). Prevents resource exhaustion.
+- TTS queue per language: Unbounded (backpressure from recognition rate).
+- Recognition: One TranslationRecognizer per session. Continuous mode until explicit stop.
 
-- **No authentication** - Anyone with code can join
-- **No session persistence** - Sessions lost on server restart
-- **In-memory storage** - Use Redis for production
-- **Single server** - No horizontal scaling yet
-- **Basic error handling** - Production needs retry logic
-- **No analytics** - Add telemetry for insights
+**Timeouts:**
+- TTS guard: 10s per segment. Node logs `missing_tts_for_active_language` if no `tts_ready` received.
+- `/process-audio`: Returns HTTP 410 if session dead (audio queue full or recognizer crashed).
+- `/end-session`: Fire-and-forget with 5s timeout. Never blocks WebSocket handler.
 
-## Future Features (TODO)
+**Continuous Recognition Lifecycle:**
+- Create once per session in `__init__`
+- `start_continuous_recognition_async()` enables multi-utterance mode
+- Audio stream stays open until session destroyed
+- Never call `recognize_once_async()` (single utterance only)
+- Never close stream until `stop()` called
 
-### Phase 2:
-- [ ] Q&A mode (listener questions)
-- [ ] Session recording and playback
-- [ ] User accounts and session history
-- [ ] Mobile apps (iOS/Android)
+**Critical Environment Variables (Purpose):**
+- `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION`  SDK credentials. Session creation fails without.
+- `NODE_BACKEND_URL`  Python  Node event emission. Broadcasts fail if pointing to localhost.
+- `REDIS_URL` / `REDIS_PASSWORD`  Session persistence. Backend crashes without.
+- `AI_SERVICE_URL`  Node  Python audio forwarding. Translation stops if incorrect.
 
-### Phase 3:
-- [ ] Multi-speaker support
-- [ ] Advanced analytics dashboard
-- [ ] Custom vocabulary/terminology
-- [ ] Offline mode with caching
+**Language Code Formats (Do NOT Mix):**
+- Short codes (`it`, `es`, `zh`)  Frontend, Redis, broadcast keys
+- Translation codes (`it`, `zh-Hans`)  Azure `add_target_language()`
+- Locale codes (`it-IT`, `es-ES`)  Azure STT config, TTS voices
 
-### Phase 4:
-- [ ] Enterprise features (SSO, RBAC)
-- [ ] API for third-party integrations
-- [ ] White-label customization
-- [ ] SLA guarantees
+---
 
-## Troubleshooting
+### Rollback Plan
 
-### Microphone not working
-- Check browser permissions (Chrome/Edge recommended)
-- Ensure HTTPS in production (required for getUserMedia)
+Revert to last known-good commit (pre-TTS bug): `git revert HEAD && git push origin main`. Auto-deployment handles backend and frontend. Manually restart AI container: `az container restart --resource-group vavilon-rg --name vavilon-ai`.
 
-### WebSocket connection fails
-- Check firewall settings
-- Verify ports 3000 and 5173 are open
-- Check proxy configuration in vite.config.js
+---
 
-### Azure Speech errors
-- Verify AZURE_SPEECH_KEY is correct
-- Check AZURE_SPEECH_REGION matches your resource
-- Ensure Speech Service quota is not exceeded
+## Changelog of Removed/Archived Content
 
-### No translations received
-- Check Python service is running (port 5000)
-- Verify AI_SERVICE_URL in backend .env
-- Check backend logs for errors
+**Items Removed from Original COPILOT_CONTEXT.md:**
 
-## Development Tips
+- **Historic deployment narratives**  Long descriptions of past deployments and fix iterations (outdated, noisy)
+- **Resolved issue deep-dives**  Multi-paragraph analyses of fixed bugs (CORS, 404 errors, stop_speaking deadlock, NODE_BACKEND_URL, TypeError hotfix) (irrelevant post-fix)
+- **Legacy diagnostic improvement sections**  Detailed logs from Feb 15 diagnostic commit 7a107ac (outdated, superseded by new logs)
+- **Verbose log examples**  30+ line JSON log dumps showing expected vs broken states (noisy, unnecessarily detailed)
+- **Auxiliary hardware scripts documentation**  `help/dubber.py`, `help/audio_interface.py`, `help/auxiliary_functions.py` (never used in web app, deprecated)
+- **Long architecture philosophy sections**  10+ paragraph explanations of event-driven design rationale (marketing tone, excessive)
+- **Duplicate Azure SDK pattern explanations**  Repeated warnings about SpeechRecognizer vs TranslationRecognizer mistakes (redundant)
+- **Session object model implementation details**  Python class internals (`_synth_threads`, `_tts_executor` structure) (overly detailed)
+- **Historic root cause walkthroughs**  Step-by-step analyses for resolved issues (outdated context)
+- **Testing results from prior deployments**  Specific test outcomes from Feb 12-15 before current bug (stale data)
+- **Lifecycle failure pattern essays**  20+ line explanations of "first sentence works, then stops" pattern (resolved, verbose)
+- **Exception handling patterns deep-dive**  Detailed code snippets on try/except wrappers in callbacks (implementation detail, overly technical)
+- **WebSocket message routing tables**  15+ row tables of every message type across all directions (excessive detail)
+- **CORS configuration resolution history**  Azure vs Express CORS conflict story (resolved, irrelevant)
+- **Redis connection issue narratives**  SocketClosedUnexpectedlyError analysis from diagnostic phase (outdated)
+- **Binary audio routing dead-ends**  Documented paths for binary WebSocket messages that don''t exist (confusion)
+- **Deployment history long-form descriptions**  Multi-paragraph commit summaries for 7a107ac and 6e08c46 (verbose, archived history)
+- **Session health degradation tracking**  Removed feature documentation for deprecated `sessionHealth` Map (no longer exists)
 
-- Use Chrome DevTools Network tab to debug WebSocket
-- Monitor Python service logs for Azure SDK errors
-- Test with 2+ browser windows (speaker + listener)
-- Use incognito mode to test multiple listeners
-
-## License
-
-Proprietary - Internal MVP
-
-## Support
-
-For issues or questions, contact the development team.
+**Total Word Count Reduction:** ~6,800 words  ~1,400 words (79% reduction)  
+**Sections Consolidated:** 42  12  
+**Readability Improvement:** Removed marketing language, passive voice, redundant warnings
