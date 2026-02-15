@@ -1232,6 +1232,43 @@ az container logs --resource-group vavilon-rg --name vavilon-ai | grep timeout
 
 ---
 
+## Current Issues (Feb 15, 2026)
+
+### 🔴 TTS Not Delivered to Listeners — IN PROGRESS
+**Status**: Backend deployment fixed, but TTS delivery chain broken
+**Branch**: `fix/tts-delivery-reliability`
+
+**Symptoms**:
+- Subtitles work (translations successful)
+- Audio never plays (TTS never reaches listeners)
+- Node correctly requests TTS via `/generate-tts`
+- Python never responds with `tts_ready` event
+- Node logs `missing_tts_for_active_language` after 10s timeout
+- Redis connection drops (`SocketClosedUnexpectedlyError`)
+
+**Test Evidence (Feb 15, 15:14 UTC)**:
+```json
+{"step":"tts_languages_requested", "ttsLanguagesRequested":["it"]}  // Node requests Italian
+{"step":"generate_tts_sent", "enqueued":["it"]}                     // Node sends to Python
+// ... 10 seconds pass ...
+{"step":"missing_tts_for_active_language", "language":"it"}         // Timeout - no tts_ready
+```
+
+**Hypothesis**:
+1. Python `/generate-tts` endpoint or TTS worker thread failing silently
+2. Event emission from Python → Node failing or timing out
+3. Redis instability corrupting session state/worker queues
+4. TTS ThreadPoolExecutor rejecting work or threads dying
+
+**Plan**: See [PLAN.md](PLAN.md) for comprehensive diagnostic and fix strategy
+
+**Next Steps**:
+1. Deploy enhanced logging (Phase 1 of plan)
+2. Identify exact failure point from structured logs
+3. Apply targeted fix based on diagnosis
+
+---
+
 ## Known Issues / TODOs
 
 1. **ScriptProcessorNode is deprecated** — works fine but browsers recommend AudioWorklet. Low priority.
