@@ -14,16 +14,52 @@
 
 ---
 
+## Quick Reference — Complete Deployment Commands
+
+**Copy and run these commands in sequence:**
+
+```powershell
+# Step 1: Push to GitHub
+git add -A
+git commit -m "fix: your change description"
+git push origin main
+
+# Step 2-3: Deploy Backend
+cd backend
+python -c "import zipfile, os; z=zipfile.ZipFile('deploy.zip','w',zipfile.ZIP_DEFLATED); z.write('package.json'); z.write('package-lock.json'); [z.write(os.path.join(r,f),os.path.join(r,f)) for r,_,fs in os.walk('src') for f in fs]; z.close()"
+az webapp deploy --resource-group vavilon-rg --name vavilon-backend --src-path "$PWD\deploy.zip" --type zip
+Remove-Item deploy.zip -Force
+cd ..
+
+# Step 4: Restart AI Container
+az container restart --name vavilon-ai --resource-group vavilon-rg
+Start-Sleep -Seconds 30
+az container show --name vavilon-ai --resource-group vavilon-rg --query "instanceView.state"
+
+# Step 5: Test
+# Open https://www.vavilonapp.rs and test end-to-end
+```
+
+**Total time:** ~2-3 minutes (backend 30-60s, AI restart 30-40s, frontend auto-deploys in background)
+
+---
+
 ## Deployment Workflow Overview
 
 ```
-Local Changes → Git Commit → Push to GitHub → GitHub Actions Deploy → Manual Verification
+Local Changes → Git Push → Manual Backend Deploy → Restart AI Container → Test
 ```
 
-### Services to Deploy
-1. **Frontend** — Azure Static Web Apps (auto-deploys via GitHub Actions)
-2. **Backend** — Azure App Service (manual deployment via Azure CLI)
-3. **AI Service** — Azure Container Instance (Docker image + restart)
+### Services and Deployment Methods
+1. **Frontend** — Azure Static Web Apps (auto-deploys via GitHub Actions on push)
+2. **Backend** — Azure App Service (**MANUAL** deployment via Azure CLI — always required)
+3. **AI Service** — Azure Container Instance (**MANUAL** restart after push triggers Docker rebuild)
+
+### Why Manual Backend Deployment?
+- **Faster:** 30-60 seconds vs 3-5 minutes for GitHub Actions
+- **Reliable:** Direct control, no workflow dependencies
+- **Verifiable:** Immediate confirmation of success
+- **Simple:** One command, no monitoring required
 
 ---
 
@@ -76,38 +112,21 @@ git push origin main
 
 ---
 
-## Step 2: Monitor GitHub Actions Deployments
+## Step 2: Deploy Backend (REQUIRED — Do Not Skip)
 
-### 2.1 Check Workflow Status
+**IMPORTANT:** Always deploy backend manually. GitHub Actions may be configured for automatic deployment, but manual deployment via Azure CLI is faster and guaranteed to work.
 
-Open browser: **https://github.com/bantula/Vavilon_webapp/actions**
-
-You should see two workflows running:
-1. **Deploy Vavilon** (Backend + AI Docker build)
-2. **Azure Static Web Apps CI/CD** (Frontend)
-
-### 2.2 Wait for Completion
-
-**Typical durations:**
-- Frontend: 2-3 minutes
-- Backend: 3-5 minutes
-- AI Docker build: 5-8 minutes
-
-**Success indicators:**
-- ✅ Green checkmark next to workflow
-- Status: "Success" or "Completed"
-
-**If red ❌ appears:**
-1. Click on the failed workflow
-2. Expand the failed step
-3. Read error logs
-4. Fix issue locally, commit, push again
+**Why manual deployment:**
+- Immediate deployment (30-60 seconds vs 3-5 minutes for GitHub Actions)
+- No dependencies on workflow configuration
+- Direct control over what gets deployed
+- Instant verification of success
 
 ---
 
-## Step 3: Deploy Backend Manually
+## Step 3: Create and Deploy Backend Package
 
-**Note:** If GitHub Actions "Deploy Vavilon" completed successfully, backend is already deployed. This step is for manual deployment or if GitHub Actions failed.
+## Step 3: Create and Deploy Backend Package
 
 ### 3.1 Navigate to Backend Directory
 
@@ -123,7 +142,7 @@ python -c "import zipfile, os; z=zipfile.ZipFile('deploy.zip','w',zipfile.ZIP_DE
 
 **Expected:** Creates `deploy.zip` (~30-50 KB)
 
-Verify:
+**Verify:**
 ```powershell
 ls deploy.zip
 ```
@@ -131,19 +150,28 @@ ls deploy.zip
 ### 3.3 Deploy to Azure App Service
 
 ```powershell
-az webapp deploy --resource-group vavilon-rg --name vavilon-backend --src-path "$(Get-Location)\deploy.zip" --type zip
+az webapp deploy --resource-group vavilon-rg --name vavilon-backend --src-path "$PWD\deploy.zip" --type zip
 ```
 
 **Expected output:**
 ```
-Deployment has completed successfully
-Status: RuntimeSuccessful
-You can visit your app at: http://vavilon-backend.azurewebsites.net
+Status: Build successful
 ```
 
 **Typical duration:** 30-60 seconds
 
-### 3.4 Clean Up
+**If deployment hangs:** Press Ctrl+C to stop monitoring (deployment continues on Azure). Then verify with Step 3.4.
+
+### 3.4 Verify Backend Deployment
+
+```powershell
+# Test backend endpoint
+Invoke-WebRequest -Uri "https://vavilon-backend.azurewebsites.net/health" -Method Get -UseBasicParsing
+```
+
+**Expected:** StatusCode 200 or 404 (not 500)
+
+### 3.5 Clean Up
 
 ```powershell
 Remove-Item deploy.zip -Force
@@ -152,9 +180,11 @@ cd ..
 
 ---
 
-## Step 4: Restart AI Container (CRITICAL)
+## Step 4: Restart AI Container (REQUIRED)
 
-**Why:** After GitHub Actions builds a new Docker image, the container must be restarted to pull and run the latest image.
+**Why:** Git push triggers GitHub Actions to rebuild Docker image. Container must restart to pull the new image.
+
+**When:** After Step 1 (git push). Can run in parallel with Step 3 (backend deploy).
 
 ### 4.1 Restart Container
 
@@ -165,16 +195,15 @@ az container restart --name vavilon-ai --resource-group vavilon-rg
 **Expected output:**
 ```json
 {
-  "containers": [...],
-  "id": "/subscriptions/.../vavilon-ai",
   "instanceView": {
     "state": "Running"
-  },
-  ...
+  }
 }
 ```
 
 **Typical duration:** 20-40 seconds
+
+**If command hangs:** Press Ctrl+C (restart continues). Verify with Step 4.3.
 
 ### 4.2 Wait for Container to Start
 
@@ -198,29 +227,18 @@ az container logs --name vavilon-ai --resource-group vavilon-rg
 
 ---
 
-## Step 5: Verify Deployments
+## Step 5: Verify All Services
 
 ### 5.1 Check Frontend
 
-**URL:** https://www.vavilonapp.rs (or https://green-pond-05766a403.1.azurestaticapps.net)
+**URL:** https://www.vavilonapp.rs
 
 Open in browser. **Expected:**
 - Landing page loads
 - No console errors (press F12 → Console tab)
 - "Create Session" and "Join Session" buttons visible
 
-### 5.2 Check Backend
-
-```powershell
-# Test backend connectivity
-Invoke-WebRequest -Uri "https://vavilon-backend.azurewebsites.net" -Method Get -UseBasicParsing
-```
-
-**Expected:**
-- StatusCode: 200 or 404 (not 500 or timeout)
-- Response within 2-3 seconds
-
-### 5.3 Check AI Container Logs
+### 5.2 Check AI Container Logs
 
 ```powershell
 az container logs --name vavilon-ai --resource-group vavilon-rg
