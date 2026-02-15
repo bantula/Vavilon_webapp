@@ -329,7 +329,6 @@ class TranslationSession:
         enqueued = []
         
         self._log('info', 'generate_tts_received',
-                  session_id=self.session_id,
                   segment_id=segment_id,
                   translations_count=len(translations),
                   requested_languages=list(translations.keys()))
@@ -337,7 +336,6 @@ class TranslationSession:
         for lang, text in translations.items():
             if lang not in self._translated_text_queues:
                 self._log('warn', 'tts_language_not_init',
-                          session_id=self.session_id,
                           language=lang,
                           segment_id=segment_id,
                           note='Language not in target_languages - skipping')
@@ -352,7 +350,6 @@ class TranslationSession:
                 enqueued.append(lang)
                 
                 self._log('info', 'tts_enqueued',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=lang,
                           text_preview=text[:50],
@@ -360,14 +357,12 @@ class TranslationSession:
                           queue_depth_after=queue_depth + 1)
             except Exception as e:
                 self._log('error', 'tts_enqueue_fail',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=lang,
                           error=str(e),
                           traceback=traceback.format_exc())
         
         self._log('info', 'generate_tts_complete',
-                  session_id=self.session_id,
                   segment_id=segment_id,
                   enqueued_count=len(enqueued),
                   enqueued_languages=enqueued)
@@ -679,7 +674,6 @@ class TranslationSession:
         mode = 'rest' if self._use_rest_tts else 'sdk'
         
         self._log('info', 'tts_worker_started',
-                  session_id=self.session_id,
                   language=language,
                   thread_id=thread_id,
                   mode=mode,
@@ -695,7 +689,6 @@ class TranslationSession:
             # Log heartbeat every 10 iterations
             if consecutive_errors == 0 and iteration_count % 10 == 0:
                 self._log('debug', 'tts_worker_alive',
-                          session_id=self.session_id,
                           language=language,
                           thread_id=thread_id,
                           queue_depth=self._translated_text_queues[language].qsize(),
@@ -725,7 +718,6 @@ class TranslationSession:
                 locale = self.TTS_LOCALE_MAP.get(language, 'unknown')
                 
                 self._log('info', 'tts_synthesis_start',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           mode=mode,
@@ -744,7 +736,6 @@ class TranslationSession:
 
                 if not audio_bytes or len(audio_bytes) == 0:
                     self._log('error', 'tts_empty_audio',
-                              session_id=self.session_id,
                               segment_id=segment_id,
                               language=language,
                               mode=mode,
@@ -755,7 +746,6 @@ class TranslationSession:
                     continue
 
                 self._log('info', 'tts_synthesis_complete',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           mode=mode,
@@ -788,7 +778,6 @@ class TranslationSession:
                 except Exception as emit_error:
                     consecutive_errors += 1
                     self._log('error', 'tts_emit_fail',
-                              session_id=self.session_id,
                               segment_id=segment_id,
                               language=language,
                               error=str(emit_error),
@@ -797,7 +786,6 @@ class TranslationSession:
                     
                     if consecutive_errors >= max_consecutive_errors:
                         self._log('critical', 'tts_worker_giving_up',
-                                  session_id=self.session_id,
                                   language=language,
                                   note=f'Failed {max_consecutive_errors} times - stopping worker')
                         break
@@ -807,7 +795,6 @@ class TranslationSession:
                 # TTS failure for one language should NOT stop recognizer
                 consecutive_errors += 1
                 self._log('error', 'tts_worker_exception',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           mode=mode,
@@ -820,7 +807,6 @@ class TranslationSession:
                 
                 if consecutive_errors >= max_consecutive_errors:
                     self._log('critical', 'tts_worker_crashed',
-                              session_id=self.session_id,
                               language=language,
                               note=f'{max_consecutive_errors} consecutive errors - worker dead')
                     break
@@ -833,7 +819,6 @@ class TranslationSession:
         # Thread exiting - log the reason
         exit_reason = 'stop_event' if self._stop_event.is_set() else 'running_flag_cleared'
         self._log('info', 'tts_worker_stopped',
-                  session_id=self.session_id,
                   language=language,
                   thread_id=thread_id,
                   exit_reason=exit_reason,
@@ -961,7 +946,6 @@ class TranslationSession:
         for attempt in range(max_retries + 1):
             try:
                 self._log('info', 'tts_emit_attempt',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           attempt=attempt + 1,
@@ -971,7 +955,6 @@ class TranslationSession:
                 resp = requests.post(url, json=event, timeout=5.0)
                 
                 self._log('info', 'tts_emit_success',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           status_code=resp.status_code,
@@ -989,7 +972,6 @@ class TranslationSession:
 
                 if resp.status_code != 200:
                     self._log('error', 'tts_ready_rejected',
-                              session_id=self.session_id,
                               segment_id=segment_id,
                               language=language,
                               status=resp.status_code,
@@ -1000,7 +982,6 @@ class TranslationSession:
             
             except requests.exceptions.Timeout as e:
                 self._log('error', 'tts_emit_timeout',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           attempt=attempt + 1,
@@ -1014,7 +995,6 @@ class TranslationSession:
             
             except Exception as e:
                 self._log('error', 'tts_emit_error',
-                          session_id=self.session_id,
                           segment_id=segment_id,
                           language=language,
                           attempt=attempt + 1,
