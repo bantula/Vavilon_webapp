@@ -1345,12 +1345,62 @@ az webapp log tail --name vavilon-backend --resource-group vavilon-rg
 
 ---
 
-### ✅ Node requests TTS, Python never delivers it — MONITORING
-**Previous Status**: Node requests Italian TTS (`tts_languages_requested:["it"]`), Node sends `POST /generate-tts` (`generate_tts_sent ... enqueued:["it"]`), Python never responds with `tts_ready` event, Node logs `missing_tts_for_active_language` after 10s timeout
+### ❌ Node requests TTS, Python never delivers it — ACTIVE ISSUE (Post-Hotfix)
+**Previous Status**: TypeError in logging (commit 7a107ac) broke 100% of TTS. Fixed in commit 6e08c46 by removing duplicate session_id kwargs.
 
-**Current Status**: Diagnostic logging deployed. Awaiting production test to identify exact failure point.
+**Current Status (February 15, 2026 - Post-Hotfix Testing)**: TypeError fixed, but TTS still fails silently. Production testing reveals:
 
-**Plan**: See [PLAN.md](PLAN.md) for comprehensive diagnostic and fix strategy (Phase 1 & 2.1 complete, awaiting diagnosis for Phase 3+)
+#### What Works ✅
+1. **Redis Connection** - Stable, no disconnects
+2. **Session Lifecycle** - Speaker/listener join, AI session starts correctly
+3. **Speech Recognition (STT)** - Multiple segments finalized successfully
+   - `segment_finalized_received` for each segment
+   - `recognizedText` captured accurately
+4. **Translation Pipeline** - All 9 languages translated, subtitles broadcast
+   - `translationCount: 9` for each segment
+   - `hasSubtitle: true` for all languages
+   - Italian listener receives subtitles correctly
+5. **TTS Request Flow (Node → Python)** - Communication working
+   - Node correctly identifies active languages: `tts_languages_requested: ["it"]`
+   - Node sends `POST /generate-tts` successfully
+   - Node logs `generate_tts_sent` with `enqueued: ["it"]`
+   - Request reaches Python service (based on lack of network errors)
+
+#### What Fails ❌
+1. **No `tts_ready` Events** - Zero TTS responses across all segments
+   - Node waits 10 seconds per segment
+   - `missing_tts_for_active_language` timeout every time
+   - `expectedLanguages: ["it"]`, `receivedLanguages: []`, `missingLanguages: ["it"]`
+   - No audio broadcast, user hears nothing
+2. **No Visible Python Errors** - Silent failure in TTS pipeline
+   - Previous run: `generate_tts_fail` with TypeError (now fixed)
+   - Latest run: No error logs visible in Node logs
+   - Suggests: TTS worker threads not running, Azure SDK hanging, or emission failing silently
+3. **Legacy Audio Dispatch Timeouts** - Separate issue, unrelated to TTS
+   - `audio_dispatch_fail` with "timeout of 5000ms exceeded"
+   - Container-to-container communication issue (not affecting STT/translation)
+
+#### Test Results Summary
+- **User spoke:** 3 sentences
+- **Subtitles delivered:** 2 segments ✅
+- **Audio delivered:** 0 segments ❌
+- **TTS requests sent:** 2
+- **TTS completions:** 0
+- **Timeout warnings:** 2 (`missing_tts_for_active_language`)
+
+#### Root Cause Analysis
+**Unknown - Requires Python AI service logs**. Diagnostic logging from commit 7a107ac should expose the failure point:
+- Are TTS worker threads starting? (`tts_worker_started`, `tts_worker_alive`)
+- Is Azure TTS SDK being called? (`tts_synthesis_start`)
+- Does Azure TTS SDK respond? (`tts_synthesis_complete` or `tts_worker_exception`)
+- Is emission to Node attempted? (`tts_emit_attempt`, `tts_emit_success`)
+- Are exceptions being swallowed silently?
+
+**Next Steps**: See [PLAN.md](PLAN.md) for comprehensive investigation plan. Must retrieve Python AI container logs to identify exact failure point before implementing targeted fix.
+
+**Critical Missing Data**: Python AI service logs from production test run not yet analyzed.
+
+**Plan**: Investigation Phase 1 (retrieve Python logs) → Identify root cause → Apply targeted fix from Phase 2 strategies
 
 ---
 
@@ -1479,6 +1529,14 @@ Auto-deploys via GitHub Actions when pushed to main (Static Web Apps).
 # No TypeError exceptions on startup
 ```
 
-**Testing Required**: Create speaker session, join as Italian listener, speak 3 sentences, verify subtitles AND audio for all sentences
+**Testing Results (Post-Hotfix)**:
+- ✅ TypeError eliminated - no more "got multiple values for keyword argument" errors
+- ✅ STT working: Speech recognition finalized multiple segments
+- ✅ Translation working: All 9 languages translated, subtitles broadcast successfully
+- ✅ TTS request sent: Node correctly sends `/generate-tts` to Python
+- ❌ **TTS still fails**: No `tts_ready` events received, zero audio delivered to listeners
+- ❌ Node logs `missing_tts_for_active_language` timeout for every segment (10s wait)
+
+**Outcome**: Hotfix solved the TypeError regression but **revealed underlying TTS issue persists**. TTS pipeline fails silently inside Python service - no visible errors in Node logs. Next step requires Python AI container log analysis to identify where TTS pipeline breaks (worker threads, Azure SDK, or emission).
 
 ---
