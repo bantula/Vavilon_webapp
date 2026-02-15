@@ -15,7 +15,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
+COPY gunicorn.conf.py .
 
 EXPOSE 5000
 
-CMD ["python", "src/app.py"]
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "src.app:app"]

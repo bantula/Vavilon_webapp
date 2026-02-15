@@ -1,396 +1,271 @@
-﻿# Post-Deployment Test Results & Fix Plan
-**Test Date:** February 15, 2026  
-**Session:** a9003fea-9f9b-405a-95dd-a4b6d5922637 (Code: 5YV8AX)  
-**Configuration:** English speaker → Italian listener  
+﻿# Vavilon Production Readiness Plan
+
+**Created:** February 15, 2026  
+**Issue:** Flask development server causing request blocking and missed segments
 
 ---
 
-## Test Results Summary
+## Root Cause Analysis
 
-### ✅ What Works (Confirmed in Production)
+### Problem Summary
+1. **Missing Segment 3:** Flask stopped receiving HTTP requests mid-session (at 19:37:42)
+2. **Audio Timeout:** Backend audio chunk 151 never reached Python (10s timeout)
+3. **No Graceful Stop:** `/end-session` request never reached Flask
 
-1. **Dynamic TTS Worker Creation** — PRIMARY FIX SUCCESSFUL
-   - Italian listener joined mid-session
-   - Italian TTS worker created on-demand ✓
-   - TTS synthesis fast: 125-367ms
-   - Audio delivered successfully for 2 sentences
+### Technical Root Cause
 
-2. **Session & Connection Management**
-   - Session creation ✓
-   - Speaker join ✓
-   - Listener join (mid-session) ✓
-   - WebSocket connections stable ✓
-   - Redis persistence ✓
+**Flask's built-in development server is single-threaded and synchronous:**
 
-3. **Speech Recognition & Translation**
-   - Azure Speech SDK recognizes English ✓
-   - Translates to 9 languages simultaneously ✓
-   - Sentence 1: "It's the first sentence." → "È la prima frase." ✓
-   - Sentence 2: "This is the second sentence." → "Questa è la seconda frase." ✓
-
-4. **Subtitle & Audio Broadcast**
-   - Subtitles delivered instantly (<200ms) ✓
-   - Audio delivered fast (125-367ms) ✓
-   - Both sentences received by Italian listener ✓
-   - No `missing_tts_for_active_language` errors ✓
-
-### ❌ What Failed (New Issues Discovered)
-
-#### Issue 1: Third Sentence Not Recognized
-**Symptom:**
-- User spoke 3 sentences
-- Only 2 `segment_finalized` events logged
-- Third sentence never reached subtitle/audio pipeline
-- Session ended at 17:59:33, last segment at 17:59:23 (10 seconds gap)
-
-**Root Cause:**
-- Azure Speech SDK continuous recognition requires **silence to finalize segments**
-- User likely stopped speaking/session too quickly
-- Azure SDK waiting for silence threshold (default 500ms per `SegmentationSilenceTimeoutMs`)
-- When speaker clicked "Stop" before final segment finalized → recognition lost
-
-**Evidence:**
-```
-17:59:23: segment_finalized for "This is the second sentence."
-17:59:27-31: Audio chunks continue (seqNo 151-201)
-17:59:32: audio_dispatch_fail (timeout)
-17:59:33: stop_speaking (session ends)
-NO third segment_finalized event
-```
-
-#### Issue 2: Audio Dispatch Timeout
-**Symptom:**
-```json
-{
-  "step": "audio_dispatch_fail",
-  "seqNo": 151,
-  "error": "timeout of 5000ms exceeded"
-}
-```
-
-**Root Cause:**
-- Node sends audio chunk (seqNo 151) to Python AI service
-- Python `/process-audio` endpoint doesn't respond within 5 seconds
-- Likely causes:
-  1. Python audio queue full (maxsize=200)
-  2. Azure SDK write blocked
-  3. Network latency spike
-  4. Python GIL contention
-
-**Impact:**
-- Non-fatal (session continues)
-- But indicates potential audio processing bottleneck
-- May cause audio stream desync
-
----
-
-## Fix Plan
-
-### Priority 1: Missing Final Segment (High Impact)
-
-**Problem:** User stops session before Azure finalizes last sentence → lost recognition.
-
-**Solution Options:**
-
-#### Option A: Delayed Session End (Recommended)
-Add grace period before ending Python AI session to allow final segment to finalize.
-
-**Implementation:**
-1. When Node receives `stop_speaking`:
-   - Send `end-session` to Python AI with `gracePeriodMs: 2000`
-   - Python AI waits 2 seconds before stopping recognizer
-   - Allows Azure to finalize pending segments
-
-2. Modify `backend/src/routes/sessions.js`:
-   ```javascript
-   // In stop_speaking handler:
-   await axios.post(`${aiServiceUrl}/end-session`, {
-     sessionId,
-     gracePeriodMs: 2000  // Wait 2 seconds for final segments
-   }, { timeout: 8000 });
-   ```
-
-3. Modify `ai-service/src/app.py`:
-   ```python
-   @app.route('/end-session', methods=['POST'])
-   def end_session():
-       grace_period_ms = data.get('gracePeriodMs', 0)
-       if grace_period_ms > 0:
-           time.sleep(grace_period_ms / 1000)
-       session.stop()
-   ```
-
-**Pros:**
-- Simple implementation
-- No user-facing changes
-- Allows natural Azure segmentation
-
-**Cons:**
-- Adds 2 seconds to session end latency
-- May not help if user stops mid-word
-
-#### Option B: Explicit Flush Command (Advanced)
-Add "Finish Speaking" button that forces Azure to finalize without waiting for silence.
-
-**Implementation:**
-1. Add button in speaker UI
-2. Send special marker to Python AI
-3. Python calls `recognizer.stop_continuous_recognition()` → triggers final callbacks
-
-**Pros:**
-- User control over finalization
-- No artificial delays
-
-**Cons:**
-- Requires UI change
-- More complex
-
-**RECOMMENDATION:** Implement Option A first (simple, effective). Consider Option B if users report frequent missing segments.
-
----
-
-### Priority 2: Audio Dispatch Timeout (Medium Impact)
-
-**Problem:** `/process-audio` timeout (5000ms) at seqNo 151.
-
-**Solution Options:**
-
-#### Option A: Increase Timeout (Quick Fix)
-Change Node's audio dispatch timeout from 5000ms to 10000ms.
-
-**Implementation:**
-```javascript
-// backend/src/websocket/wsHandler.js
-const response = await axios.post(
-  `${aiServiceUrl}/process-audio`,
-  audioData,
-  { timeout: 10000 }  // Increased from 5000
-);
-```
-
-**Pros:**
-- One-line change
-- Tolerates occasional latency spikes
-
-**Cons:**
-- Doesn't fix root cause
-- Longer timeouts may mask real issues
-
-#### Option B: Increase Python Audio Queue Size (Defensive)
-Change `maxsize=200` to `maxsize=500` in `speech_service.py`.
-
-**Implementation:**
 ```python
-# ai-service/src/speech_service.py
-self._audio_queue: queue.Queue = queue.Queue(maxsize=500)
+# Current: ai-service/src/app.py line 393
+app.run(host='0.0.0.0', port=port, debug=False)
 ```
 
-**Pros:**
-- Absorbs burst traffic better
-- Prevents queue full errors
+**What happens:**
+1. Backend sends audio chunks rapidly (every 85ms, ~12 requests/second)
+2. Flask processes requests one at a time in a single thread
+3. If one request blocks (Azure SDK call, TTS synthesis), all subsequent requests queue
+4. Queue fills up → backend times out → session fails
+
+**Evidence from logs:**
+- Flask received 125 audio chunks successfully
+- Last successful request: 19:37:42
+- Backend continued sending until chunk 232 (missed 107 chunks)
+- Container resources: 1 CPU, 1.5GB RAM (adequate, not a resource issue)
+
+**Your intuition is CORRECT:** We need `gunicorn` with `--threads`, not `--workers`.
+
+---
+
+## Solution: Production WSGI Server with Threading
+
+### Why Gunicorn with --threads?
+
+**✅ Use `--threads` (threading model):**
+- **ONE process** = shared memory space
+- Azure SDK objects (TranslationRecognizer, AudioInputStream) are safely shared
+- Session state (`sessions` dict) works correctly
+- TTS ThreadPoolExecutor works as designed
+- Lower memory footprint (1 process vs multiple)
+
+**❌ DON'T use `--workers` (multi-process):**
+- Multiple processes = separate memory spaces
+- `sessions` dict NOT shared across processes
+- Backend could send request to Worker 1, but session lives in Worker 2
+- Would require Redis/external state management (unnecessary complexity)
+
+**Recommended Configuration:**
+```bash
+gunicorn --bind 0.0.0.0:5000 \
+         --workers 1 \
+         --threads 4 \
+         --timeout 60 \
+         --worker-class sync \
+         --access-logfile - \
+         --error-logfile - \
+         src.app:app
+```
+
+**Why these settings:**
+- `--workers 1`: Single process (shared state)
+- `--threads 4`: Handle 4 concurrent HTTP requests (audio + TTS + segments + health checks)
+- `--timeout 60`: Allow long-running Azure SDK calls (graceful stop takes 2s + TTS synthesis ~1-2s)
+- `--worker-class sync`: Standard synchronous worker (no async/gevent complexity needed)
+- Logs to stdout/stderr for Azure Container Instance log capture
+
+---
+
+## Implementation Steps
+
+### Step 1: Update Requirements
+**File:** `ai-service/requirements.txt`
+
+**Add:**
+```
+gunicorn==22.0.0
+```
+
+### Step 2: Update Dockerfile
+**File:** `ai-service/Dockerfile`
+
+**Change:**
+```dockerfile
+CMD ["python", "src/app.py"]
+```
+
+**To:**
+```dockerfile
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "60", "--worker-class", "sync", "--access-logfile", "-", "--error-logfile", "-", "src.app:app"]
+```
+
+**Alternative (cleaner):** Create `gunicorn.conf.py` and use:
+```dockerfile
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "src.app:app"]
+```
+
+### Step 3: Deploy Changes
+
+**Commands:**
+```powershell
+# From workspace root
+git add ai-service/
+git commit -m "feat: switch to gunicorn with threading for production readiness"
+git push origin main
+
+# Wait for GitHub Actions to build new Docker image (~5 min)
+# Monitor: https://github.com/bantula/Vavilon_webapp/actions
+
+# Restart container to pull new image
+az container restart --name vavilon-ai --resource-group vavilon-rg
+Start-Sleep -Seconds 30
+az container show --name vavilon-ai --resource-group vavilon-rg --query "instanceView.state"
+```
+
+### Step 4: Test End-to-End
+
+**Test Scenario:**
+1. Create English speaker session
+2. Join Italian listener
+3. Speak **5 sentences rapidly** (stress test)
+4. Stop IMMEDIATELY after sentence 5
+5. Verify ALL 5 segments received
+6. Verify NO audio_dispatch_fail timeouts
+
+**Expected Logs:**
+```json
+// Backend
+{"step":"stop_speaking","note":"Ending session with graceful stop"}
+{"step":"ai_session_ended","graceful":true}
+
+// Python
+{"step":"end_session_request","graceful":true}
+{"step":"graceful_stop_closing_stream"}
+{"step":"graceful_stop_wait_complete"}
+{"step":"session_cleanup_complete"}
+```
+
+---
+
+## Alternative Approaches (Not Recommended)
+
+### Option A: Flask with Threaded Mode
+```python
+app.run(host='0.0.0.0', port=port, threaded=True)
+```
 
 **Cons:**
-- More memory usage
-- Doesn't address write blocking
+- Still a development server (Flask docs warn against production use)
+- Less control over thread pool size
+- No production-grade features (worker restart, health checks, graceful shutdown)
 
-#### Option C: Make Audio Dispatch Fire-and-Forget (Aggressive)
-Don't wait for `/process-audio` response — send audio asynchronously.
-
-**Implementation:**
-```javascript
-// Don't await response
-axios.post(aiServiceUrl, audioData, { timeout: 2000 })
-  .catch(err => log('audio_dispatch_fail', { error: err.message }));
+### Option B: Multiple Workers + Redis Session Store
+```bash
+gunicorn --workers 4 --bind 0.0.0.0:5000 src.app:app
 ```
-
-**Pros:**
-- Never blocks WebSocket handler
-- Faster audio streaming
 
 **Cons:**
-- No feedback on delivery success
-- May overwhelm Python service
-
-**RECOMMENDATION:** Implement Option A + B together (increase timeout to 10s, increase queue to 500).
-
----
-
-### Priority 3: Session End Logging (Low Impact)
-
-**Problem:** `audio_dispatch` continues after `stop_speaking` with `traceId: null`.
-
-**Evidence:**
-```
-17:59:33: stop_speaking (traceId: 8bbbe7b5)
-17:59:33: audio_dispatch (traceId: null)  ← orphaned chunk
-```
-
-**Solution:** Ensure WebSocket closes immediately after `stop_speaking` to prevent orphaned audio chunks.
-
-**Implementation:**
-```javascript
-// backend/src/routes/sessions.js
-// After calling /end-session:
-ws.terminate();  // Force close speaker WebSocket
-```
+- Requires Redis for `sessions` dict
+- More complex (serialize Azure SDK objects?)
+- Higher memory usage (4 processes × 1.5GB each = 6GB)
+- Azure Container Instance would need upgrade
+- Overkill for current load (~1-5 concurrent sessions)
 
 ---
 
-## Implementation Status
+## Risk Assessment
 
-### ✅ Phase 1: IMPLEMENTED — Close Stream Then Stop Recognizer
+### Low Risk Changes
+✅ Adding gunicorn (battle-tested, industry standard)  
+✅ Threading model (Python GIL released during I/O operations like Azure SDK calls)  
+✅ 4 threads for 1-5 concurrent sessions = large safety margin
 
-**Implementation Details:**
-
-Instead of a simple `time.sleep()`, implemented a robust "Close Stream then Stop Recognizer" flow:
-
-1. **Modified `speech_service.py`:**
-   - Added `graceful` parameter to `stop()` method
-   - When `graceful=True`: 
-     - Closes audio stream FIRST (signals end-of-input to Azure)
-     - Waits 2 seconds for Azure to finalize pending segments
-     - Then stops recognizer
-     - Then cleans up TTS threads
-   - Stream close triggers Azure to finalize all buffered audio
-   - No arbitrary delay — Azure-driven finalization
-
-2. **Updated `app.py` `/end-session` endpoint:**
-   - Added `graceful` parameter (default: false)
-   - Passes `graceful` flag to `session.stop(graceful=True/False)`
-   - Logs graceful vs normal stop
-
-3. **Updated `backend/src/websocket/wsHandler.js`:**
-   - `stop_speaking` handler now sends `graceful: true` to Python
-   - Increased timeout from 5s to 8s to accommodate grace period
-   - Speaker disconnect remains non-graceful (unexpected termination)
-
-**Benefits over simple sleep:**
-- Stream close actively signals Azure "no more audio coming"
-- Azure finalizes segments faster than arbitrary wait
-- 100% guarantee all buffered audio is processed
-- More deterministic than time-based approach
-
-**Files Changed:**
-- `ai-service/src/speech_service.py` (graceful stop logic)
-- `ai-service/src/app.py` (graceful parameter)
-- `backend/src/websocket/wsHandler.js` (graceful: true on stop_speaking)
-
----
-
-### ✅ Phase 2: IMPLEMENTED — Increase Timeouts & Queue Size
-
-**Changes:**
-
-1. **Backend audio dispatch timeout:** 5s → 10s
-   - File: `backend/src/websocket/wsHandler.js`
-   - Line: `timeout: 10000` (was 5000)
-   - Tolerates occasional Python processing delays
-
-2. **Python audio queue size:** 200 → 500
-   - File: `ai-service/src/speech_service.py`
-   - Line: `maxsize=500` (was 200)
-   - Absorbs burst traffic better
-   - Prevents queue-full errors during high load
-
-**Expected Impact:**
-- Eliminates `audio_dispatch_fail` timeout errors
-- Better resilience during network latency spikes
-- Handles longer sessions without queue overflow
-
----
-
-## Implementation Priority
-
-1. **PHASE 1 (High Priority — Fixes Missing Segments):** ✅ **COMPLETE**
-   - [x] Implement close-stream-then-stop pattern (better than sleep)
-   - [x] Add `graceful` parameter to `/end-session`
-   - [x] Python waits after closing stream (Azure-driven)
-   - [x] Test: Say 3 sentences, stop immediately, verify all 3 recognized
-
-2. **PHASE 2 (Medium Priority — Improves Reliability):** ✅ **COMPLETE**
-   - [x] Increase audio dispatch timeout to 10000ms
-   - [x] Increase Python audio queue to 500
-   - [x] Test: Long session (10+ sentences) without timeouts
-
-3. **PHASE 3 (Low Priority — Cleanup):**
-   - [ ] Close WebSocket immediately after `stop_speaking`
-   - [ ] Add final segment count to `stop_speaking` log
-   - [ ] Monitor for orphaned audio chunks
-
----
-
-## Expected Outcomes
-
-**After Phase 1:**
-- ✅ All sentences recognized, even if user stops quickly
-- ✅ Final segment delivered within 2 seconds of stopping
-- ❌ Audio dispatch timeouts may still occur
-
-**After Phase 2:**
-- ✅ Audio dispatch timeouts eliminated (or <1% occurrence)
-- ✅ Sessions stable for 10+ minutes
-- ❌ Minor session end cleanup issues
-
-**After Phase 3:**
-- ✅ Clean session termination
-- ✅ No orphaned logs
-- ✅ Production-ready
-
----
-
-## Testing Checklist
-
-### Basic Test (3 Sentences)
-- [ ] Create session (English speaker)
-- [ ] Join as Italian listener mid-session
-- [ ] Say: "This is sentence one"
-- [ ] Wait 2 seconds
-- [ ] Say: "This is sentence two"
-- [ ] Wait 2 seconds
-- [ ] Say: "This is sentence three"
-- [ ] Wait 2 seconds, then stop
-- [ ] Verify: 3 subtitles + 3 audio clips received
-
-### Rapid Stop Test (Stress Final Segment)
-- [ ] Create session
-- [ ] Say 3 sentences quickly (1 second apart)
-- [ ] Stop immediately after third sentence
-- [ ] Verify: 3 segments recognized (may take 2 seconds post-stop)
-
-### Long Session Test (Stress Audio Queue)
-- [ ] Create session
-- [ ] Say 10 sentences over 5 minutes
-- [ ] Verify: No `audio_dispatch_fail` timeouts
-- [ ] Verify: All 10 segments have audio
-
-### Multiple Listeners Test
-- [ ] Create session
-- [ ] Join 3 listeners (Italian, Spanish, German)
-- [ ] Say 5 sentences
-- [ ] Verify: All 3 listeners get all 5 audios
-- [ ] Check logs: 3 dynamic workers created
+### Testing Checklist
+- [ ] Segments 1-5 all finalized
+- [ ] No audio_dispatch_fail timeouts
+- [ ] Graceful stop logs present
+- [ ] TTS audio delivered for all segments
+- [ ] Container stable for 10+ minutes after test
+- [ ] Memory usage remains under 1GB (check `az container show`)
 
 ---
 
 ## Rollback Plan
 
-If Phase 1 causes issues:
+If gunicorn causes issues:
+
 ```powershell
-# Revert to previous commit
-git log --oneline -5
+# Revert to Flask dev server
 git revert HEAD
 git push origin main
 
-# Restart AI container
+# Wait for GitHub Actions
 az container restart --name vavilon-ai --resource-group vavilon-rg
 ```
+
+**Or:** Immediately restart with old image:
+```powershell
+az container show --name vavilon-ai --resource-group vavilon-rg --query "containers[0].image"
+# Note the previous image SHA
+az container create --resource-group vavilon-rg --name vavilon-ai-old --image vavilonacr.azurecr.io/vavilon-ai@sha256:<OLD_SHA> ...
+```
+
+---
+
+## Expected Outcome
+
+**Before (Flask dev server):**
+- ❌ 2/3 segments (missed final)
+- ❌ Audio timeouts after ~125 chunks
+- ❌ Single-threaded blocking
+- ❌ Not production-ready
+
+**After (Gunicorn + threading):**
+- ✅ 5/5 segments (100% reliability)
+- ✅ No audio timeouts (concurrent request handling)
+- ✅ 4 concurrent threads (audio, TTS, segments, graceful stop)
+- ✅ Production-ready deployment
+
+---
+
+## Timeline
+
+**Estimated Time:** 20 minutes total
+- Code changes: 5 min
+- Git commit/push: 1 min
+- GitHub Actions build: 5-8 min
+- Container restart: 1 min
+- End-to-end test: 3-5 min
+
+**Go/No-Go Decision Point:** After test in Step 4  
+**Success Criteria:** All 5 segments received + no timeouts
+
+---
+
+## Questions?
+
+**Q: Why not async (gevent/eventlet)?**  
+A: Azure Speech SDK is synchronous. Threading is simpler and sufficient for current load.
+
+**Q: Why only 4 threads?**  
+A: Typical concurrent requests: 1 audio chunk + 1 TTS request + 1 segment callback + 1 health check = 4 max.
+
+**Q: What if we scale to 100 concurrent sessions?**  
+A: Then we'd need `--workers 4 --threads 8` (32 concurrent requests) + increase container CPU to 4 cores and memory to 4GB. But that's future optimization.
 
 ---
 
 ## Next Steps
 
-1. Implement Phase 1 (delayed session end)
-2. Deploy to Azure
-3. Test with rapid stop scenario
-4. Measure final segment delivery rate (target: >95%)
-5. Proceed to Phase 2 if Phase 1 successful
+**Ready to proceed?**
+1. Review this plan
+2. Confirm threading approach (vs workers)
+3. Execute Step 1-4
+4. Report test results
+
+**Alternatively:** Test locally first:
+```powershell
+cd ai-service
+pip install gunicorn
+gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 src.app:app
+# Test via http://localhost:5000/health
+```
