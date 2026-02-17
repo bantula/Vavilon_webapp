@@ -22,6 +22,7 @@
 - **Chat Conversation UI:** Listener subtitles redesigned as a modern chat interface. Guide messages appear on the left with a tour guide avatar, translations on the right with a robot translator avatar. Smooth animations, auto-scroll, mobile-friendly.
 - **QR Code Deep Links:** QR codes on the speaker page now link directly to `www.vavilonapp.rs/join?code=ABC123`. Listeners scan, pick a language, and join — no manual code entry needed. SPA routing fallback via `staticwebapp.config.json`.
 - **Guide Speaking Indicator:** Animated three-dot typing indicator appears next to the guide avatar when the guide is actively speaking. Hides on sentence finalization, re-shows between sentences. 300ms debounce prevents flash. Respects `prefers-reduced-motion` and screen readers. Feature flag: `SHOW_GUIDE_TYPING`.
+- **End-of-Session Overlay:** When the speaker ends the tour, listeners see a polished full-screen overlay with a thank-you message and "Return to Home" button. WebSocket and audio streams are cleaned up automatically. No more dead session views.
 
 **Production URL:** https://www.vavilonapp.rs
 
