@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import config from '../config'
 
 const LANGUAGES = [
@@ -90,6 +90,7 @@ function TypingIndicator() {
 
 function ListenerPage() {
   const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
   const codeFromUrl = searchParams.get('code')
 
   const [joinCode, setJoinCode] = useState(codeFromUrl || '')
@@ -100,6 +101,7 @@ function ListenerPage() {
   const [status, setStatus] = useState('')
   const [isBypassMode, setIsBypassMode] = useState(false)
   const [showIndicator, setShowIndicator] = useState(false)
+  const [sessionEnded, setSessionEnded] = useState(false)
 
   const wsRef = useRef(null)
   const audioContextRef = useRef(null)
@@ -258,9 +260,10 @@ function ListenerPage() {
         break
 
       case 'speaker_disconnected':
-        setStatus('Speaker has ended the tour')
         bypassNextTimeRef.current = 0
         if (SHOW_GUIDE_TYPING) stopTypingIndicator()
+        cleanup()
+        setSessionEnded(true)
         break
 
       case 'error':
@@ -343,8 +346,14 @@ function ListenerPage() {
     setIsJoined(false)
     setIsBypassMode(false)
     setShowIndicator(false)
+    setSessionEnded(false)
     setStatus('')
     setChatMessages([])
+  }
+
+  const handleReturnHome = () => {
+    cleanup()
+    navigate('/')
   }
 
   const cleanup = () => {
@@ -434,6 +443,26 @@ function ListenerPage() {
 
           <div ref={chatEndRef} />
         </div>
+
+        {/* Session ended overlay */}
+        {sessionEnded && (
+          <div className="session-ended-overlay">
+            <div className="session-ended-card">
+              <div className="session-ended-icon">
+                <svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="28" cy="28" r="28" fill="#667eea" opacity="0.1" />
+                  <circle cx="28" cy="28" r="20" fill="#667eea" opacity="0.15" />
+                  <path d="M22 28l4 4 8-8" stroke="#667eea" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              <h2 className="session-ended-title">Thank you for joining the tour!</h2>
+              <p className="session-ended-sub">This session has now ended. We hope you enjoyed the experience.</p>
+              <button className="session-ended-btn" onClick={handleReturnHome}>
+                Return to Home
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     )
   }

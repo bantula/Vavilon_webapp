@@ -455,6 +455,83 @@ body {
   }
 }
 
+/* ── Session ended overlay ────────────────────────────────────── */
+
+.session-ended-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+  animation: overlayFadeIn 0.4s ease-out;
+}
+
+@keyframes overlayFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.session-ended-card {
+  text-align: center;
+  padding: 40px 32px;
+  max-width: 340px;
+}
+
+.session-ended-icon {
+  margin-bottom: 20px;
+}
+
+.session-ended-title {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: #1a1a2e;
+  margin-bottom: 10px;
+  line-height: 1.3;
+}
+
+.session-ended-sub {
+  font-size: 0.95rem;
+  color: #666;
+  line-height: 1.5;
+  margin-bottom: 28px;
+}
+
+.session-ended-btn {
+  display: inline-block;
+  padding: 14px 36px;
+  font-size: 1rem;
+  font-weight: 600;
+  color: white;
+  background: linear-gradient(135deg, #667eea 0%, #7c5ce0 100%);
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  box-shadow: 0 4px 14px rgba(102, 126, 234, 0.35);
+}
+
+.session-ended-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(102, 126, 234, 0.45);
+}
+
+.session-ended-btn:active {
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-ended-overlay {
+    animation: none;
+  }
+  .session-ended-btn {
+    transition: none;
+  }
+}
+
 /* ── Responsive ───────────────────────────────────────────────── */
 
 @media (max-width: 600px) {
