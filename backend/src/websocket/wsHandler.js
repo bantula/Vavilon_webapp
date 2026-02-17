@@ -493,17 +493,14 @@ async function handleSpeakerDisconnect(connectionId) {
   // Continue with cleanup immediately
   await setSpeakerConnected(conn.sessionId, false);
 
-  const session = await getSession(conn.sessionId);
-  if (session && session.listeners) {
-    for (const [language, listeners] of Object.entries(session.listeners)) {
-      listeners.forEach(listenerId => {
-        sendMessage(listenerId, {
-          type: 'speaker_disconnected',
-          payload: {}
-        });
-      });
-    }
-  }
+  // Notify all listeners using in-memory connections (not Redis).
+  // This avoids a race condition where DELETE /api/sessions deletes
+  // the Redis session before this handler runs, causing getSession()
+  // to return null and listeners to never receive the notification.
+  broadcastStatusToListeners(conn.sessionId, {
+    type: 'speaker_disconnected',
+    payload: {}
+  });
 }
 
 async function handleDisconnect(connectionId) {
