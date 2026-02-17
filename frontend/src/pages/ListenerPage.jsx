@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import config from '../config'
 
@@ -15,6 +15,60 @@ const LANGUAGES = [
   { code: 'ar', name: 'Arabic' }
 ]
 
+/* ── Inline SVG avatars ─────────────────────────────────────────── */
+
+function GuideAvatar() {
+  return (
+    <svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="18" cy="18" r="18" fill="#667eea" />
+      {/* Hat brim */}
+      <ellipse cx="18" cy="12" rx="11" ry="3" fill="#4f5dd4" />
+      {/* Hat top */}
+      <rect x="10" y="5" width="16" height="8" rx="3" fill="#5568d3" />
+      {/* Face */}
+      <circle cx="18" cy="21" r="7" fill="#fde68a" />
+      {/* Eyes */}
+      <circle cx="15.5" cy="20" r="1" fill="#333" />
+      <circle cx="20.5" cy="20" r="1" fill="#333" />
+      {/* Smile */}
+      <path d="M15 23.5 Q18 26 21 23.5" stroke="#333" strokeWidth="1" strokeLinecap="round" fill="none" />
+      {/* Flag stick */}
+      <line x1="28" y1="8" x2="28" y2="18" stroke="#ef4444" strokeWidth="1.5" strokeLinecap="round" />
+      {/* Flag */}
+      <path d="M28 8 L33 10.5 L28 13 Z" fill="#ef4444" />
+    </svg>
+  )
+}
+
+function TranslatorAvatar() {
+  return (
+    <svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="18" cy="18" r="18" fill="#10b981" />
+      {/* Robot head */}
+      <rect x="10" y="10" width="16" height="14" rx="4" fill="#e0f2fe" />
+      {/* Antenna */}
+      <line x1="18" y1="6" x2="18" y2="10" stroke="#e0f2fe" strokeWidth="2" strokeLinecap="round" />
+      <circle cx="18" cy="5" r="2" fill="#fbbf24" />
+      {/* Eyes */}
+      <circle cx="14.5" cy="16" r="2" fill="#3b82f6" />
+      <circle cx="21.5" cy="16" r="2" fill="#3b82f6" />
+      {/* Eye glints */}
+      <circle cx="15.2" cy="15.3" r="0.6" fill="white" />
+      <circle cx="22.2" cy="15.3" r="0.6" fill="white" />
+      {/* Mouth */}
+      <rect x="13" y="20" width="10" height="2" rx="1" fill="#94a3b8" />
+      {/* Mouth segments */}
+      <line x1="16" y1="20" x2="16" y2="22" stroke="#e0f2fe" strokeWidth="0.5" />
+      <line x1="20" y1="20" x2="20" y2="22" stroke="#e0f2fe" strokeWidth="0.5" />
+      {/* Ear bolts */}
+      <circle cx="8" cy="17" r="2" fill="#94a3b8" />
+      <circle cx="28" cy="17" r="2" fill="#94a3b8" />
+    </svg>
+  )
+}
+
+/* ── Component ──────────────────────────────────────────────────── */
+
 function ListenerPage() {
   const [searchParams] = useSearchParams()
   const codeFromUrl = searchParams.get('code')
@@ -22,33 +76,34 @@ function ListenerPage() {
   const [joinCode, setJoinCode] = useState(codeFromUrl || '')
   const [selectedLanguage, setSelectedLanguage] = useState('en')
   const [isJoined, setIsJoined] = useState(false)
-  const [currentSubtitle, setCurrentSubtitle] = useState('')
-  const [subtitleHistory, setSubtitleHistory] = useState([])
+  const [chatMessages, setChatMessages] = useState([])
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [isBypassMode, setIsBypassMode] = useState(false)
 
   const wsRef = useRef(null)
   const audioContextRef = useRef(null)
-  // Queue audio playback so chunks don't overlap (translation mode)
   const audioQueueRef = useRef([])
   const isPlayingRef = useRef(false)
-  // Time-scheduled gapless playback (bypass mode)
   const bypassNextTimeRef = useRef(0)
+  const chatEndRef = useRef(null)
+  const messageIdRef = useRef(0)
 
   useEffect(() => {
     return () => cleanup()
   }, [])
 
-  /**
-   * Initialize AudioContext on user gesture (required by browsers).
-   * Called when joining a session.
-   */
+  // Auto-scroll to newest message
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [chatMessages])
+
   const initAudioContext = () => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
     }
-    // Resume if suspended (browser autoplay policy)
     if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume()
     }
@@ -73,9 +128,7 @@ function ListenerPage() {
         return
       }
 
-      // Init audio context on this user gesture (click)
       initAudioContext()
-
       setupWebSocket(data.session.id)
     } catch (err) {
       console.error('Error joining session:', err)
@@ -114,13 +167,13 @@ function ListenerPage() {
     }
   }
 
-  const handleWebSocketMessage = (message) => {
+  const handleWebSocketMessage = useCallback((message) => {
     const { type, payload } = message
 
     switch (type) {
       case 'listener_joined':
         setIsJoined(true)
-        setStatus('Connected - Listening for translations...')
+        setStatus('')
         setError('')
         break
 
@@ -133,13 +186,19 @@ function ListenerPage() {
         setIsBypassMode(true)
         break
 
-      case 'subtitle':
-        setCurrentSubtitle(payload.text)
-        setSubtitleHistory(prev => [...prev.slice(-4), payload.text])
+      case 'subtitle': {
+        const id = ++messageIdRef.current
+        setChatMessages(prev => [...prev, {
+          id,
+          originalText: payload.originalText || null,
+          translatedText: payload.text,
+          timestamp: Date.now()
+        }])
         break
+      }
 
       case 'speaker_disconnected':
-        setStatus('Speaker has disconnected')
+        setStatus('Speaker has ended the tour')
         bypassNextTimeRef.current = 0
         break
 
@@ -148,18 +207,13 @@ function ListenerPage() {
         setStatus('')
         break
     }
-  }
+  }, [])
 
-  /**
-   * Queue audio for sequential playback.
-   * The AI service sends WAV audio (RIFF header + PCM data) as base64.
-   * AudioContext.decodeAudioData handles WAV natively.
-   */
+  /* ── Audio playback (unchanged logic) ───────────────────────── */
+
   const queueAudio = (audioDataBase64) => {
-    console.log(`Queueing audio: ${audioDataBase64.length} chars, queue size: ${audioQueueRef.current.length}`)
     audioQueueRef.current.push(audioDataBase64)
     if (!isPlayingRef.current) {
-      console.log('Starting audio playback')
       playNextInQueue()
     }
   }
@@ -175,58 +229,33 @@ function ListenerPage() {
 
     try {
       const ctx = audioContextRef.current
-      if (!ctx) {
-        console.error('AudioContext not initialized')
-        playNextInQueue()
-        return
-      }
-
-      // Resume if suspended
+      if (!ctx) { playNextInQueue(); return }
       if (ctx.state === 'suspended') await ctx.resume()
 
-      console.log(`Decoding audio: ${audioDataBase64.length} chars`)
-
-      // Decode base64 to ArrayBuffer
       const binaryString = atob(audioDataBase64)
       const bytes = new Uint8Array(binaryString.length)
       for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i)
       }
 
-      console.log(`Audio bytes decoded: ${bytes.length} bytes`)
-
-      // decodeAudioData handles WAV (RIFF) format natively
       const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
-
-      console.log(`Audio decoded: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz`)
-
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
       source.connect(ctx.destination)
-      source.onended = () => {
-        console.log('Audio playback finished')
-        playNextInQueue()
-      }
+      source.onended = () => playNextInQueue()
       source.start(0)
     } catch (err) {
       console.error('Error playing audio:', err)
-      // Skip this chunk and try the next one
       playNextInQueue()
     }
   }
 
-  /**
-   * Bypass mode: play speaker's raw audio with gapless scheduling.
-   * Uses AudioContext.currentTime to schedule each chunk immediately
-   * after the previous one — no gaps, no overlap, lowest latency.
-   */
   const playBypassAudio = async (audioDataBase64) => {
     try {
       const ctx = audioContextRef.current
       if (!ctx) return
       if (ctx.state === 'suspended') await ctx.resume()
 
-      // Decode base64 WAV to AudioBuffer
       const binaryString = atob(audioDataBase64)
       const bytes = new Uint8Array(binaryString.length)
       for (let i = 0; i < binaryString.length; i++) {
@@ -234,15 +263,9 @@ function ListenerPage() {
       }
       const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
 
-      // Schedule gapless: each chunk starts exactly when the previous ends
       const now = ctx.currentTime
-      if (bypassNextTimeRef.current < now) {
-        bypassNextTimeRef.current = now
-      }
-      // Cap buffer to 2s ahead to prevent unbounded drift
-      if (bypassNextTimeRef.current > now + 2) {
-        bypassNextTimeRef.current = now
-      }
+      if (bypassNextTimeRef.current < now) bypassNextTimeRef.current = now
+      if (bypassNextTimeRef.current > now + 2) bypassNextTimeRef.current = now
 
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
@@ -259,8 +282,7 @@ function ListenerPage() {
     setIsJoined(false)
     setIsBypassMode(false)
     setStatus('')
-    setCurrentSubtitle('')
-    setSubtitleHistory([])
+    setChatMessages([])
   }
 
   const cleanup = () => {
@@ -273,58 +295,84 @@ function ListenerPage() {
     }
   }
 
-  if (isJoined) {
-    return (
-      <div className="container">
-        <div className="card">
-          <div className="header">
-            <h1>Listening</h1>
-            <p>Language: {LANGUAGES.find(l => l.code === selectedLanguage)?.name}</p>
-          </div>
+  /* ── Joined: Chat conversation view ─────────────────────────── */
 
-          {status && (
-            <div className="status status-success">{status}</div>
+  if (isJoined) {
+    const langName = LANGUAGES.find(l => l.code === selectedLanguage)?.name || selectedLanguage
+
+    return (
+      <div className="chat-container">
+        {/* Header bar */}
+        <div className="chat-header">
+          <div className="chat-header-left">
+            <GuideAvatar />
+            <div>
+              <div className="chat-header-title">Live Tour</div>
+              <div className="chat-header-lang">{langName}</div>
+            </div>
+          </div>
+          <button className="chat-leave-btn" onClick={handleLeave}>Leave</button>
+        </div>
+
+        {error && <div className="chat-error">{error}</div>}
+
+        {/* Chat body */}
+        <div className="chat-body">
+          {chatMessages.length === 0 && !status && (
+            <div className="chat-empty">
+              <div className="chat-empty-icon">
+                <GuideAvatar />
+              </div>
+              <p className="chat-empty-title">Waiting for the guide...</p>
+              <p className="chat-empty-sub">Translations will appear here as the tour begins</p>
+            </div>
           )}
 
-          {error && (
-            <div className="error-message">{error}</div>
+          {status && chatMessages.length === 0 && (
+            <div className="chat-status-pill">{status}</div>
           )}
 
           {isBypassMode ? (
-            <div className="subtitle-box">
-              <div className="subtitle-text" style={{ fontSize: '1.3rem' }}>
-                Live audio — same language as speaker
+            <div className="chat-bypass">
+              <div className="chat-bypass-icon">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.03 3 3 7.03 3 12s4.03 9 9 9 9-4.03 9-9-4.03-9-9-9zm-1 14v-6l5 3-5 3z" fill="#667eea"/></svg>
               </div>
-              <p style={{ color: '#888', fontSize: '0.85rem', marginTop: '8px' }}>
-                Direct stream, no translation needed
-              </p>
+              <span>Live audio — same language as speaker</span>
             </div>
           ) : (
-            <div className="subtitle-box">
-              {subtitleHistory.length > 1 && (
-                <div style={{ opacity: 0.5, fontSize: '0.9rem', marginBottom: '8px' }}>
-                  {subtitleHistory.slice(0, -1).map((text, i) => (
-                    <div key={i} className="subtitle-text">{text}</div>
-                  ))}
+            chatMessages.map((msg) => (
+              <div key={msg.id} className="chat-exchange">
+                {/* Guide bubble (original speech) */}
+                {msg.originalText && (
+                  <div className="chat-row chat-row-left">
+                    <div className="chat-avatar"><GuideAvatar /></div>
+                    <div className="chat-bubble chat-bubble-guide">
+                      {msg.originalText}
+                    </div>
+                  </div>
+                )}
+                {/* Translation bubble */}
+                <div className="chat-row chat-row-right">
+                  <div className="chat-bubble chat-bubble-translation">
+                    {msg.translatedText}
+                  </div>
+                  <div className="chat-avatar"><TranslatorAvatar /></div>
                 </div>
-              )}
-              <div className="subtitle-text" style={{ fontSize: '1.3rem' }}>
-                {currentSubtitle || 'Waiting for translation...'}
               </div>
-            </div>
+            ))
           )}
 
-          <button
-            className="button button-secondary"
-            onClick={handleLeave}
-            style={{ marginTop: '20px' }}
-          >
-            Leave Session
-          </button>
+          {status && chatMessages.length > 0 && (
+            <div className="chat-status-pill">{status}</div>
+          )}
+
+          <div ref={chatEndRef} />
         </div>
       </div>
     )
   }
+
+  /* ── Join form (pre-join) ───────────────────────────────────── */
 
   return (
     <div className="container">

@@ -64,8 +64,9 @@ router.post('/', async (req, res) => {
       });
 
       // Broadcast subtitles to all listeners immediately (per language)
+      // Include recognizedText so listeners can show original speech alongside translation
       for (const [lang, text] of Object.entries(translations)) {
-        await broadcastToListeners(sessionId, lang, null, text);
+        await broadcastToListeners(sessionId, lang, null, text, recognizedText);
       }
 
       // Filter translations to only languages with active listeners

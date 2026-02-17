@@ -395,7 +395,7 @@ function broadcastBypassAudio(sessionId, language, pcmBase64) {
  * Broadcast translated audio/subtitles to listeners.
  * Called by AI service via POST /api/broadcast.
  */
-async function broadcastToListeners(sessionId, language, audioData, subtitleText) {
+async function broadcastToListeners(sessionId, language, audioData, subtitleText, originalText) {
   const listenerIds = await getListenersByLanguage(sessionId, language);
 
   slog('info', 'node', 'broadcast', {
@@ -412,9 +412,11 @@ async function broadcastToListeners(sessionId, language, audioData, subtitleText
     const conn = connections.get(connectionId);
     if (conn && conn.ws.readyState === WebSocket.OPEN) {
       if (subtitleText) {
+        const subtitlePayload = { text: subtitleText, language };
+        if (originalText) subtitlePayload.originalText = originalText;
         sendMessage(connectionId, {
           type: 'subtitle',
-          payload: { text: subtitleText, language }
+          payload: subtitlePayload
         });
       }
       if (audioData) {
