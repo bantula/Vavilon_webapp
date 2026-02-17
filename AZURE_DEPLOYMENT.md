@@ -581,6 +581,6 @@ az container show --name vavilon-ai --resource-group vavilon-rg --query "contain
 
 ---
 
-**Last Successful Deployment:** [Update after each successful deployment]  
-**Current Version:** [Git commit hash]  
-**Known Issues:** See [PLAN.md](PLAN.md)
+**Last Successful Deployment:** February 17, 2026
+**Current Version:** d64ad68 (feat: redesign listener subtitles as chat conversation UI)
+**Known Issues:** Azure Speech SDK occasionally produces 0 recognitions despite audio flowing — suspected Azure-side issue

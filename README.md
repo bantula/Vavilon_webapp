@@ -1,5 +1,5 @@
 ﻿# Vavilon DOO  Real-Time Translation Platform
-**Documentation Date:** February 16, 2026  
+**Documentation Date:** February 17, 2026
 **Status:** ✅ Fully Operational in Production
 
 ---
@@ -10,13 +10,18 @@
 
 **Deployment Model:** Three-service architecture on Microsoft Azure: React frontend (Static Web Apps), Node.js backend (App Service with Redis session cache), Python AI service (Container Instance with Azure Speech SDK). Continuous delivery via GitHub Actions from main branch.
 
-**Current Status (Feb 16, 2026):**
+**Current Status (Feb 17, 2026):**
 ✅ **FULLY OPERATIONAL IN PRODUCTION**
 
 - **Working:** Real-time speech translation (9 languages), instant subtitle broadcast, TTS audio delivery to all listeners, session management, WebSocket streaming, Redis persistence, Gunicorn production WSGI server (4 threads).
 - **Verified:** End-to-end test completed successfully — 5 rapid sentences, all segments finalized, all audio delivered, no timeouts.
 - **Performance:** Translation latency <500ms, TTS synthesis 125-367ms, same-language bypass <200ms.
 - **Deployment:** Frontend (Static Web Apps auto-deploy), Backend (App Service manual deploy), AI Service (Container Instance, Gunicorn with threading).
+
+**Recent Features (Feb 17, 2026):**
+- **Chat Conversation UI:** Listener subtitles redesigned as a modern chat interface. Guide messages appear on the left with a tour guide avatar, translations on the right with a robot translator avatar. Smooth animations, auto-scroll, mobile-friendly.
+- **QR Code Deep Links:** QR codes on the speaker page now link directly to `www.vavilonapp.rs/join?code=ABC123`. Listeners scan, pick a language, and join — no manual code entry needed. SPA routing fallback via `staticwebapp.config.json`.
+- **Guide Speaking Indicator:** Animated three-dot typing indicator appears next to the guide avatar when the guide is actively speaking. Hides on sentence finalization, re-shows between sentences. 300ms debounce prevents flash. Respects `prefers-reduced-motion` and screen readers. Feature flag: `SHOW_GUIDE_TYPING`.
 
 **Production URL:** https://www.vavilonapp.rs
 
@@ -540,6 +545,7 @@ az container create \
 - **Feb 15, 2026:** Deployed graceful session end to capture final segments
 - **Feb 15, 2026:** Fixed dynamic TTS worker creation for mid-session joins
 - **Feb 16, 2026:** Complete end-to-end testing successful → all systems operational
+- **Feb 17, 2026:** Chat conversation UI for listener subtitles, QR code deep links, guide speaking indicator
 
 **Key Technical Decisions:**
 1. **Gunicorn over Flask:** Production WSGI server with threading model (4 threads, 1 worker)
@@ -580,5 +586,5 @@ az container create \
 
 ---
 
-**Last Updated:** February 16, 2026  
+**Last Updated:** February 17, 2026
 **Status:** ✅ Production Ready — All Systems Operational
