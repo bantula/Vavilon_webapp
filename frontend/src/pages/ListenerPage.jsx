@@ -67,6 +67,25 @@ function TranslatorAvatar() {
   )
 }
 
+/* ── Feature flag ──────────────────────────────────────────────── */
+
+const SHOW_GUIDE_TYPING = true // Toggle to disable typing indicator
+
+/* ── Typing indicator component ───────────────────────────────── */
+
+function TypingIndicator() {
+  return (
+    <div className="chat-row chat-row-left typing-indicator" role="status" aria-label="Guide is speaking">
+      <div className="chat-avatar"><GuideAvatar /></div>
+      <div className="chat-bubble chat-bubble-guide typing-bubble">
+        <span className="typing-dot" />
+        <span className="typing-dot" />
+        <span className="typing-dot" />
+      </div>
+    </div>
+  )
+}
+
 /* ── Component ──────────────────────────────────────────────────── */
 
 function ListenerPage() {
@@ -80,6 +99,7 @@ function ListenerPage() {
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [isBypassMode, setIsBypassMode] = useState(false)
+  const [showIndicator, setShowIndicator] = useState(false)
 
   const wsRef = useRef(null)
   const audioContextRef = useRef(null)
@@ -88,17 +108,20 @@ function ListenerPage() {
   const bypassNextTimeRef = useRef(0)
   const chatEndRef = useRef(null)
   const messageIdRef = useRef(0)
+  const guideSpeakingRef = useRef(false)
+  const showDebounceRef = useRef(null)
+  const reShowTimerRef = useRef(null)
 
   useEffect(() => {
     return () => cleanup()
   }, [])
 
-  // Auto-scroll to newest message
+  // Auto-scroll to newest message or typing indicator
   useEffect(() => {
     if (chatEndRef.current) {
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [chatMessages])
+  }, [chatMessages, showIndicator])
 
   const initAudioContext = () => {
     if (!audioContextRef.current) {
@@ -167,6 +190,17 @@ function ListenerPage() {
     }
   }
 
+  const clearTypingTimers = useCallback(() => {
+    if (showDebounceRef.current) { clearTimeout(showDebounceRef.current); showDebounceRef.current = null }
+    if (reShowTimerRef.current) { clearTimeout(reShowTimerRef.current); reShowTimerRef.current = null }
+  }, [])
+
+  const stopTypingIndicator = useCallback(() => {
+    guideSpeakingRef.current = false
+    clearTypingTimers()
+    setShowIndicator(false)
+  }, [clearTypingTimers])
+
   const handleWebSocketMessage = useCallback((message) => {
     const { type, payload } = message
 
@@ -194,12 +228,39 @@ function ListenerPage() {
           translatedText: payload.text,
           timestamp: Date.now()
         }])
+        // Hide typing indicator on finalization
+        if (SHOW_GUIDE_TYPING) {
+          clearTypingTimers()
+          setShowIndicator(false)
+          // Re-show after 1.5s if guide is still speaking
+          if (guideSpeakingRef.current) {
+            reShowTimerRef.current = setTimeout(() => {
+              if (guideSpeakingRef.current) setShowIndicator(true)
+            }, 1500)
+          }
+        }
         break
       }
+
+      case 'guide_speaking_started':
+        if (SHOW_GUIDE_TYPING) {
+          guideSpeakingRef.current = true
+          clearTypingTimers()
+          // 300ms debounce to avoid flash for instant finalizations
+          showDebounceRef.current = setTimeout(() => {
+            if (guideSpeakingRef.current) setShowIndicator(true)
+          }, 300)
+        }
+        break
+
+      case 'guide_speaking_stopped':
+        if (SHOW_GUIDE_TYPING) stopTypingIndicator()
+        break
 
       case 'speaker_disconnected':
         setStatus('Speaker has ended the tour')
         bypassNextTimeRef.current = 0
+        if (SHOW_GUIDE_TYPING) stopTypingIndicator()
         break
 
       case 'error':
@@ -207,7 +268,7 @@ function ListenerPage() {
         setStatus('')
         break
     }
-  }, [])
+  }, [clearTypingTimers, stopTypingIndicator])
 
   /* ── Audio playback (unchanged logic) ───────────────────────── */
 
@@ -281,6 +342,7 @@ function ListenerPage() {
     cleanup()
     setIsJoined(false)
     setIsBypassMode(false)
+    setShowIndicator(false)
     setStatus('')
     setChatMessages([])
   }
@@ -289,6 +351,8 @@ function ListenerPage() {
     audioQueueRef.current = []
     isPlayingRef.current = false
     bypassNextTimeRef.current = 0
+    guideSpeakingRef.current = false
+    clearTypingTimers()
     if (wsRef.current) {
       wsRef.current.close()
       wsRef.current = null
@@ -365,6 +429,8 @@ function ListenerPage() {
           {status && chatMessages.length > 0 && (
             <div className="chat-status-pill">{status}</div>
           )}
+
+          {SHOW_GUIDE_TYPING && showIndicator && !isBypassMode && <TypingIndicator />}
 
           <div ref={chatEndRef} />
         </div>

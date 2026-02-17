@@ -229,6 +229,12 @@ async function handleStartSpeaking(connectionId, payload) {
       type: 'speaking_started',
       payload: { traceId: conn.traceId }
     });
+
+    // Notify all listeners that the guide is speaking
+    broadcastStatusToListeners(conn.sessionId, {
+      type: 'guide_speaking_started',
+      payload: {}
+    });
   } catch (error) {
     const errData = error.response?.data || error.message;
     slog('error', 'node', 'ai_session_start_fail', {
@@ -279,6 +285,12 @@ async function handleStopSpeaking(connectionId) {
         note: 'Failed to cleanly end AI session - session may be orphaned'
       });
     });
+
+  // Notify all listeners that the guide stopped speaking
+  broadcastStatusToListeners(conn.sessionId, {
+    type: 'guide_speaking_stopped',
+    payload: {}
+  });
 
   // Reset connection state immediately (don't wait for Python)
   conn.traceId = null;
@@ -388,6 +400,21 @@ function broadcastBypassAudio(sessionId, language, pcmBase64) {
 
   for (const ws of listeners) {
     ws.send(message);
+  }
+}
+
+/**
+ * Broadcast a status message to ALL listeners in a session (regardless of language).
+ * Used for guide speaking started/stopped indicators.
+ */
+function broadcastStatusToListeners(sessionId, message) {
+  const msgStr = JSON.stringify(message);
+  for (const [, conn] of connections) {
+    if (conn.sessionId === sessionId &&
+        conn.role === 'listener' &&
+        conn.ws.readyState === WebSocket.OPEN) {
+      conn.ws.send(msgStr);
+    }
   }
 }
 
