@@ -581,6 +581,42 @@ az container show --name vavilon-ai --resource-group vavilon-rg --query "contain
 
 ---
 
-**Last Successful Deployment:** February 17, 2026
-**Current Version:** d64ad68 (feat: redesign listener subtitles as chat conversation UI)
+**Last Successful Deployment:** February 22, 2026
+**Current Version:** feature/guide-login (feat: guide login page and access control)
 **Known Issues:** Azure Speech SDK occasionally produces 0 recognitions despite audio flowing — suspected Azure-side issue
+
+---
+
+## Guide Login — Operations Notes
+
+### New Environment Variable
+Set `ADMIN_SECRET` on the App Service before using the admin endpoint:
+```powershell
+az webapp config appsettings set --name vavilon-backend --resource-group vavilon-rg --settings ADMIN_SECRET="<your-secret-here>"
+```
+
+### Importing Guides (Manual Provisioning)
+1. Copy `backend/data/guides_template.csv` → `backend/data/guides.csv`
+2. Fill in guide records (one row per access window; same username = merged)
+3. Run from backend directory with production Redis credentials:
+```powershell
+$env:REDIS_URL="vavilon-cache.redis.cache.windows.net"
+$env:REDIS_PASSWORD="<redis-primary-key>"
+node scripts/import-guides.js
+```
+
+### Admin REST Endpoint (single guide)
+```powershell
+# Add/update guide
+Invoke-RestMethod -Uri "https://vavilon-backend.azurewebsites.net/api/admin/guides" `
+  -Method POST `
+  -Headers @{ "X-Admin-Key" = "<ADMIN_SECRET>"; "Content-Type" = "application/json" } `
+  -Body '{"firstName":"John","lastName":"Doe","username":"john.doe.1234","email":"john@agency.com","phone":"+381601234567","accessWindows":[{"startDate":"2026-10-06","endDate":"2026-10-08"}]}'
+
+# List all guides
+Invoke-RestMethod -Uri "https://vavilon-backend.azurewebsites.net/api/admin/guides" `
+  -Headers @{ "X-Admin-Key" = "<ADMIN_SECRET>" }
+```
+
+### Username Format
+`firstname.lastname.NNNN` — e.g. `john.doe.1234` (4-digit random suffix, lowercase)

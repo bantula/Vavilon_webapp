@@ -18,6 +18,10 @@
 - **Performance:** Translation latency <500ms, TTS synthesis 125-367ms, same-language bypass <200ms.
 - **Deployment:** Frontend (Static Web Apps auto-deploy), Backend (App Service manual deploy), AI Service (Container Instance, Gunicorn with threading).
 
+**Recent Features (Feb 22, 2026):**
+- **Guide Login & Access Control:** Tour guides must log in with a username before starting a session. Three outcomes: (A) username valid + access today → proceeds to speaker view, (B) username valid but no access today → friendly message with scheduled dates listed + "Contact app owner" mailto link, (C) username not found → guidance to contact agency. Speaker view shows "Welcome {name}!" banner and "Log out" button.
+- **Ops Guide Management:** Guide accounts stored in Redis. CSV template (`backend/data/guides_template.csv`) + import script (`backend/scripts/import-guides.js`) for manual provisioning of up to 30 guides. REST admin endpoint (`POST/GET /api/admin/guides`) protected by `X-Admin-Key` header. Date-range access windows (YYYY-MM-DD), local-date comparison.
+
 **Recent Features (Feb 17, 2026):**
 - **Chat Conversation UI:** Listener subtitles redesigned as a modern chat interface. Guide messages appear on the left with a tour guide avatar, translations on the right with a robot translator avatar. Smooth animations, auto-scroll, mobile-friendly.
 - **QR Code Deep Links:** QR codes on the speaker page now link directly to `www.vavilonapp.rs/join?code=ABC123`. Listeners scan, pick a language, and join — no manual code entry needed. SPA routing fallback via `staticwebapp.config.json`.

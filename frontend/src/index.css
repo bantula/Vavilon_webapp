@@ -572,3 +572,139 @@ body {
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.15);
   }
 }
+
+/* ── Login page ──────────────────────────────────────────────────────── */
+
+.login-label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 500;
+  color: #374151;
+}
+
+.login-hint {
+  margin-top: 24px;
+  font-size: 0.82rem;
+  color: #9ca3af;
+  text-align: center;
+  line-height: 1.5;
+}
+
+/* Outcome views (no-access, not-found) */
+
+.login-outcome {
+  margin-top: 16px;
+  text-align: center;
+}
+
+.login-outcome-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  margin: 0 auto 16px;
+}
+
+.login-outcome-icon--warn {
+  background: #fef3c7;
+}
+
+.login-outcome-icon--error {
+  background: #fee2e2;
+}
+
+.login-outcome-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #111827;
+  margin-bottom: 12px;
+}
+
+.login-outcome-body {
+  font-size: 0.93rem;
+  color: #4b5563;
+  line-height: 1.65;
+  margin-bottom: 10px;
+  text-align: left;
+}
+
+.login-scheduled-dates {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 18px 0;
+  text-align: left;
+}
+
+.login-scheduled-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+}
+
+.login-scheduled-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.login-scheduled-list li {
+  font-size: 0.93rem;
+  color: #374151;
+  padding: 4px 0;
+}
+
+.login-scheduled-list li::before {
+  content: '→ ';
+  color: #667eea;
+  font-weight: 600;
+}
+
+.login-outcome-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+/* ── Speaker guide bar ──────────────────────────────────────────────── */
+
+.speaker-guide-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+  border-radius: 12px;
+  padding: 10px 16px;
+  margin-bottom: 20px;
+}
+
+.speaker-guide-welcome {
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  line-height: 1.3;
+}
+
+.speaker-logout-btn {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  white-space: nowrap;
+}
+
+.speaker-logout-btn:hover {
+  background: rgba(255, 255, 255, 0.32);
+}

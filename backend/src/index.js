@@ -16,6 +16,8 @@ const cors = require('cors');
 const sessionRoutes = require('./routes/sessions');
 const broadcastRoutes = require('./routes/broadcast');
 const eventsRoutes = require('./routes/events');
+const authRoutes = require('./routes/auth');
+const adminRoutes = require('./routes/admin');
 const { setupWebSocket } = require('./websocket/wsHandler');
 
 const app = express();
@@ -37,6 +39,8 @@ app.use(express.json({ limit: '5mb' }));
 app.use('/api/sessions', sessionRoutes);
 app.use('/api/broadcast', broadcastRoutes);
 app.use('/api/events', eventsRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

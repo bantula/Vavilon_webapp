@@ -1,45 +1,7 @@
-import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import config from '../config'
 
 function LandingPage() {
   const navigate = useNavigate()
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-
-  const handleStartTour = async () => {
-    setLoading(true)
-    setError('')
-
-    try {
-      const response = await fetch(`${config.apiUrl}/api/sessions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      })
-
-      const data = await response.json()
-
-      if (data.success) {
-        // Navigate to speaker page with session ID
-        navigate(`/speaker/${data.session.sessionId}`, {
-          state: { session: data.session }
-        })
-      } else {
-        setError('Failed to create session')
-      }
-    } catch (err) {
-      console.error('Error creating session:', err)
-      setError('Failed to connect to server')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleJoinTour = () => {
-    navigate('/join')
-  }
 
   return (
     <div className="container">
@@ -49,25 +11,17 @@ function LandingPage() {
           <p>Real-Time Translation for Tours & Events</p>
         </div>
 
-        {error && (
-          <div className="error-message">
-            {error}
-          </div>
-        )}
-
         <div style={{ marginTop: '40px' }}>
           <button
             className="button button-primary"
-            onClick={handleStartTour}
-            disabled={loading}
+            onClick={() => navigate('/login')}
           >
-            {loading ? 'Creating Session...' : 'Start a Tour'}
+            Start a Tour
           </button>
 
           <button
             className="button button-secondary"
-            onClick={handleJoinTour}
-            disabled={loading}
+            onClick={() => navigate('/join')}
           >
             Join a Tour
           </button>

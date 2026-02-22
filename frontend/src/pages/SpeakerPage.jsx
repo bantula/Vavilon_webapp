@@ -29,6 +29,8 @@ function SpeakerPage() {
   const navigate = useNavigate()
 
   const [session, setSession] = useState(location.state?.session || null)
+  const guide = location.state?.guide || null
+
   const [isRecording, setIsRecording] = useState(false)
   const [stats, setStats] = useState(null)
   const [error, setError] = useState('')
@@ -214,10 +216,15 @@ function SpeakerPage() {
     stopRecording()
     try {
       await fetch(`${config.apiUrl}/api/sessions/${sessionId}`, { method: 'DELETE' })
-      navigate('/')
     } catch (err) {
       console.error('Error ending session:', err)
     }
+    navigate('/')
+  }
+
+  const handleLogOut = () => {
+    cleanup()
+    navigate('/')
   }
 
   const cleanup = () => {
@@ -241,6 +248,18 @@ function SpeakerPage() {
   return (
     <div className="container">
       <div className="card">
+        {/* Guide welcome banner */}
+        {guide && (
+          <div className="speaker-guide-bar">
+            <span className="speaker-guide-welcome">
+              Welcome, {guide.firstName} {guide.lastName}!
+            </span>
+            <button className="speaker-logout-btn" onClick={handleLogOut}>
+              Log out
+            </button>
+          </div>
+        )}
+
         <div className="header">
           <h1>Speaker View</h1>
           <p>Share this code with your audience</p>
