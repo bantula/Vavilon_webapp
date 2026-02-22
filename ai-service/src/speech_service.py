@@ -34,13 +34,18 @@ class TranslationSession:
 
     TRANSLATION_LANG_MAP = {
         'en': 'en', 'es': 'es', 'fr': 'fr', 'de': 'de', 'it': 'it',
-        'pt': 'pt', 'ru': 'ru', 'zh': 'zh-Hans', 'ja': 'ja', 'ar': 'ar'
+        'pt': 'pt', 'ru': 'ru', 'zh': 'zh-Hans', 'ja': 'ja', 'ar': 'ar',
+        'sr': 'sr-Cyrl', 'mk': 'mk', 'bg': 'bg', 'hu': 'hu', 'ro': 'ro',
+        'hr': 'hr', 'sl': 'sl', 'sk': 'sk', 'pl': 'pl', 'uk': 'uk',
     }
 
     TTS_LOCALE_MAP = {
         'en': 'en-US', 'es': 'es-ES', 'fr': 'fr-FR', 'de': 'de-DE',
         'it': 'it-IT', 'pt': 'pt-PT', 'ru': 'ru-RU', 'zh': 'zh-CN',
-        'ja': 'ja-JP', 'ar': 'ar-SA'
+        'ja': 'ja-JP', 'ar': 'ar-SA',
+        'sr': 'sr-RS', 'mk': 'mk-MK', 'bg': 'bg-BG', 'hu': 'hu-HU',
+        'ro': 'ro-RO', 'hr': 'hr-HR', 'sl': 'sl-SI', 'sk': 'sk-SK',
+        'pl': 'pl-PL', 'uk': 'uk-UA',
     }
 
     # Neural voice names for REST API TTS fallback
@@ -55,6 +60,16 @@ class TranslationSession:
         'zh-CN': 'zh-CN-XiaoxiaoNeural',
         'ja-JP': 'ja-JP-NanamiNeural',
         'ar-SA': 'ar-SA-ZariyahNeural',
+        'sr-RS': 'sr-RS-SophieNeural',
+        'mk-MK': 'mk-MK-MarijaNeural',
+        'bg-BG': 'bg-BG-KalinaNeural',
+        'hu-HU': 'hu-HU-NoemiNeural',
+        'ro-RO': 'ro-RO-AlinaNeural',
+        'hr-HR': 'hr-HR-GabrijelaNeural',
+        'sl-SI': 'sl-SI-PetraNeural',
+        'sk-SK': 'sk-SK-ViktoriaNeural',
+        'pl-PL': 'pl-PL-AgnieszkaNeural',
+        'uk-UA': 'uk-UA-PolinaNeural',
     }
 
     def __init__(self, session_id: str, trace_id: str,

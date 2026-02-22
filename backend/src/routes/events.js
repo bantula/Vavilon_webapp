@@ -54,28 +54,29 @@ router.post('/', async (req, res) => {
       // Compute active listener languages from Redis session data
       const activeLanguages = await getSessionListenerLanguages(sessionId);
 
+      // Filter translations to only languages with active listeners (subtitles + TTS)
+      const activeTranslations = {};
+      for (const [lang, text] of Object.entries(translations)) {
+        if (activeLanguages.has(lang)) activeTranslations[lang] = text;
+      }
+
       slog('info', 'segment_finalized_received', {
         sessionId,
         segmentId,
         traceId,
-        translationCount: Object.keys(translations).length,
-        activeLanguages_at_segment: [...activeLanguages],
+        activeLanguages: [...activeLanguages],
+        activeTranslations: Object.fromEntries(
+          Object.entries(activeTranslations).map(([l, t]) => [l, t.substring(0, 60)])
+        ),
         recognizedText: recognizedText?.substring(0, 60)
       });
 
-      // Broadcast subtitles to all listeners immediately (per language)
-      // Include recognizedText so listeners can show original speech alongside translation
-      for (const [lang, text] of Object.entries(translations)) {
+      // Broadcast subtitles only to languages that have active listeners
+      for (const [lang, text] of Object.entries(activeTranslations)) {
         await broadcastToListeners(sessionId, lang, null, text, recognizedText);
       }
 
-      // Filter translations to only languages with active listeners
-      const ttsTranslations = {};
-      for (const [lang, text] of Object.entries(translations)) {
-        if (activeLanguages.has(lang)) {
-          ttsTranslations[lang] = text;
-        }
-      }
+      const ttsTranslations = activeTranslations;
 
       const ttsLanguagesRequested = Object.keys(ttsTranslations);
 
@@ -83,8 +84,6 @@ router.post('/', async (req, res) => {
         sessionId,
         segmentId,
         traceId,
-        activeLanguages: [...activeLanguages],
-        allTranslationLanguages: Object.keys(translations),
         ttsLanguagesRequested
       });
 

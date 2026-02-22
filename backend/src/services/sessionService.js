@@ -78,7 +78,8 @@ async function createSession() {
     isActive: true,
     speakerConnected: false,
     listeners: {}, // languageCode -> array of connectionIds
-    supportedLanguages: ['en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'zh', 'ja', 'ar']
+    supportedLanguages: ['en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'zh', 'ja', 'ar',
+                         'sr', 'mk', 'bg', 'hu', 'ro', 'hr', 'sl', 'sk', 'pl', 'uk']
   };
 
   // Store in Redis with 24 hour expiration

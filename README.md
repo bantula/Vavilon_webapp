@@ -19,6 +19,8 @@
 - **Deployment:** Frontend (Static Web Apps auto-deploy), Backend (App Service manual deploy), AI Service (Container Instance, Gunicorn with threading).
 
 **Recent Features (Feb 22, 2026):**
+- **10 New Languages:** Added Serbian 🇷🇸, Macedonian 🇲🇰, Bulgarian 🇧🇬, Hungarian 🇭🇺, Romanian 🇷🇴, Croatian 🇭🇷, Slovenian 🇸🇮, Slovak 🇸🇰, Polish 🇵🇱, Ukrainian 🇺🇦 — now 20 languages total. All language pickers show flag emojis. Full STT, translation, and TTS support via Azure Speech SDK.
+- **Log filtering:** Backend `segment_finalized` logs now show only translations for languages with active listeners, and subtitle broadcasts skip languages with no active listeners.
 - **Guide Login & Access Control:** Tour guides must log in with a username before starting a session. Three outcomes: (A) username valid + access today → proceeds to speaker view, (B) username valid but no access today → friendly message with scheduled dates listed + "Contact app owner" mailto link, (C) username not found → guidance to contact agency. Speaker view shows "Welcome {name}!" banner and "Log out" button.
 - **Ops Guide Management:** Guide accounts stored in Redis. CSV template (`backend/data/guides_template.csv`) + import script (`backend/scripts/import-guides.js`) for manual provisioning of up to 30 guides. REST admin endpoint (`POST/GET /api/admin/guides`) protected by `X-Admin-Key` header. Date-range access windows (YYYY-MM-DD), local-date comparison.
 

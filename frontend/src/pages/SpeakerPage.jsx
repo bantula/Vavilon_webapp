@@ -43,22 +43,33 @@ function SpeakerPage() {
   const mediaStreamRef = useRef(null)
 
   const SOURCE_LANGUAGES = [
-    { code: 'en-US', name: 'English' },
-    { code: 'es-ES', name: 'Spanish' },
-    { code: 'fr-FR', name: 'French' },
-    { code: 'de-DE', name: 'German' },
-    { code: 'it-IT', name: 'Italian' },
-    { code: 'pt-PT', name: 'Portuguese' },
-    { code: 'ru-RU', name: 'Russian' },
-    { code: 'zh-CN', name: 'Chinese' },
-    { code: 'ja-JP', name: 'Japanese' },
-    { code: 'ar-SA', name: 'Arabic' }
+    { code: 'en-US', name: '🇬🇧 English' },
+    { code: 'es-ES', name: '🇪🇸 Spanish' },
+    { code: 'fr-FR', name: '🇫🇷 French' },
+    { code: 'de-DE', name: '🇩🇪 German' },
+    { code: 'it-IT', name: '🇮🇹 Italian' },
+    { code: 'pt-PT', name: '🇵🇹 Portuguese' },
+    { code: 'ru-RU', name: '🇷🇺 Russian' },
+    { code: 'zh-CN', name: '🇨🇳 Chinese' },
+    { code: 'ja-JP', name: '🇯🇵 Japanese' },
+    { code: 'ar-SA', name: '🇸🇦 Arabic' },
+    { code: 'sr-RS', name: '🇷🇸 Serbian' },
+    { code: 'mk-MK', name: '🇲🇰 Macedonian' },
+    { code: 'bg-BG', name: '🇧🇬 Bulgarian' },
+    { code: 'hu-HU', name: '🇭🇺 Hungarian' },
+    { code: 'ro-RO', name: '🇷🇴 Romanian' },
+    { code: 'hr-HR', name: '🇭🇷 Croatian' },
+    { code: 'sl-SI', name: '🇸🇮 Slovenian' },
+    { code: 'sk-SK', name: '🇸🇰 Slovak' },
+    { code: 'pl-PL', name: '🇵🇱 Polish' },
+    { code: 'uk-UA', name: '🇺🇦 Ukrainian' },
   ]
 
   // All target languages except the source
   const getTargetLanguages = useCallback(() => {
     const sourceShort = sourceLanguage.split('-')[0]
-    return ['en','es','fr','de','it','pt','ru','zh','ja','ar']
+    return ['en','es','fr','de','it','pt','ru','zh','ja','ar',
+            'sr','mk','bg','hu','ro','hr','sl','sk','pl','uk']
       .filter(l => l !== sourceShort)
   }, [sourceLanguage])
 
