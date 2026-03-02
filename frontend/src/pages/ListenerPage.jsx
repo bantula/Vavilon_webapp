@@ -124,29 +124,9 @@ function ListenerPage() {
   const showDebounceRef = useRef(null)
   const reShowTimerRef = useRef(null)
 
-  const [debugLogs, setDebugLogs] = useState([])
-  const isDebugMode = searchParams.get('debug') === '1'
-
   useEffect(() => {
     return () => cleanup()
   }, [])
-
-  // Intercept [iOS-diag] console calls and show them on screen (activated via ?debug=1)
-  useEffect(() => {
-    if (!isDebugMode) return
-    const origLog = console.log
-    const origError = console.error
-    const capture = (level, args) => {
-      const msg = args.map(a => {
-        try { return typeof a === 'object' ? JSON.stringify(a) : String(a) } catch { return '[obj]' }
-      }).join(' ')
-      if (!msg.includes('[iOS-diag]')) return
-      setDebugLogs(prev => [...prev.slice(-49), { level, text: msg.replace('[iOS-diag] ', '') }])
-    }
-    console.log = (...args) => { origLog(...args); capture('log', args) }
-    console.error = (...args) => { origError(...args); capture('err', args) }
-    return () => { console.log = origLog; console.error = origError }
-  }, [isDebugMode])
 
   // Auto-scroll to newest message or typing indicator
   useEffect(() => {
@@ -158,14 +138,9 @@ function ListenerPage() {
   const initAudioContext = () => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
-      console.log('[iOS-diag] AudioContext CREATED, state:', audioContextRef.current.state)
-    } else {
-      console.log('[iOS-diag] AudioContext EXISTS, state:', audioContextRef.current.state)
     }
     if (audioContextRef.current.state === 'suspended') {
-      const p = audioContextRef.current.resume()
-      p.then(() => console.log('[iOS-diag] initAudioContext resume() RESOLVED, state:', audioContextRef.current.state))
-       .catch(e => console.error('[iOS-diag] initAudioContext resume() REJECTED:', e))
+      audioContextRef.current.resume()
     }
   }
 
@@ -175,14 +150,12 @@ function ListenerPage() {
       return
     }
 
-    console.log('[iOS-diag] handleJoin: SYNC start — gesture token valid here')
     setError('')
     setStatus('Connecting...')
 
     try {
       const response = await fetch(`${config.apiUrl}/api/sessions/${joinCode}`)
       const data = await response.json()
-      console.log('[iOS-diag] handleJoin: AFTER await — gesture token likely expired on iOS')
 
       if (!data.success) {
         setError('Session not found')
@@ -191,7 +164,6 @@ function ListenerPage() {
       }
 
       initAudioContext()
-      console.log('[iOS-diag] handleJoin: AudioContext state after init:', audioContextRef.current?.state)
       setupWebSocket(data.session.id)
     } catch (err) {
       console.error('Error joining session:', err)
@@ -252,7 +224,6 @@ function ListenerPage() {
         break
 
       case 'audio':
-        console.log('[iOS-diag] audio received, length:', payload.audioData?.length)
         queueAudio(payload.audioData)
         break
 
@@ -312,7 +283,7 @@ function ListenerPage() {
     }
   }, [clearTypingTimers, stopTypingIndicator])
 
-  /* ── Audio playback (unchanged logic) ───────────────────────── */
+  /* ── Audio playback ──────────────────────────────────────────── */
 
   const queueAudio = (audioDataBase64) => {
     audioQueueRef.current.push(audioDataBase64)
@@ -333,9 +304,7 @@ function ListenerPage() {
     try {
       const ctx = audioContextRef.current
       if (!ctx) { playNextInQueue(); return }
-      console.log('[iOS-diag] playNextInQueue: ctx state BEFORE resume:', ctx.state, '| queue remaining:', audioQueueRef.current.length)
       if (ctx.state === 'suspended') await ctx.resume()
-      console.log('[iOS-diag] playNextInQueue: ctx state AFTER resume:', ctx.state)
 
       const binaryString = atob(audioDataBase64)
       const bytes = new Uint8Array(binaryString.length)
@@ -344,15 +313,13 @@ function ListenerPage() {
       }
 
       const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
-      console.log('[iOS-diag] decoded: duration', audioBuffer.duration, '| sampleRate', audioBuffer.sampleRate, '| channels', audioBuffer.numberOfChannels)
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
       source.connect(ctx.destination)
       source.onended = () => playNextInQueue()
       source.start(0)
-      console.log('[iOS-diag] source.start(0) called at ctx.currentTime:', ctx.currentTime)
     } catch (err) {
-      console.error('[iOS-diag] playNextInQueue FAILED:', err.name, err.message, err)
+      console.error('Audio playback error:', err)
       playNextInQueue()
     }
   }
@@ -411,41 +378,12 @@ function ListenerPage() {
     }
   }
 
-  /* ── On-screen debug panel (activated via ?debug=1) ─────────── */
-
-  const debugPanel = isDebugMode ? (
-    <div style={{
-      position: 'fixed', bottom: 0, left: 0, right: 0,
-      maxHeight: '40vh', overflowY: 'auto',
-      background: 'rgba(0,0,0,0.88)', color: '#39ff14',
-      fontFamily: 'monospace', fontSize: '11px',
-      padding: '8px', zIndex: 9999,
-      borderTop: '2px solid #39ff14'
-    }}>
-      <div style={{ fontWeight: 'bold', color: '#ffe600', marginBottom: '4px' }}>
-        iOS Debug — {debugLogs.length} line{debugLogs.length !== 1 ? 's' : ''}
-      </div>
-      {debugLogs.length === 0
-        ? <div style={{ color: '#888' }}>No [iOS-diag] logs yet. Join a session.</div>
-        : debugLogs.map((entry, i) => (
-            <div key={i} style={{
-              color: entry.level === 'err' ? '#ff6b6b' : '#39ff14',
-              marginBottom: '2px', wordBreak: 'break-all'
-            }}>
-              {entry.text}
-            </div>
-          ))
-      }
-    </div>
-  ) : null
-
   /* ── Joined: Chat conversation view ─────────────────────────── */
 
   if (isJoined) {
     const langName = LANGUAGES.find(l => l.code === selectedLanguage)?.name || selectedLanguage
 
     return (
-      <>
       <div className="chat-container">
         {/* Header bar */}
         <div className="chat-header">
@@ -536,15 +474,12 @@ function ListenerPage() {
           </div>
         )}
       </div>
-      {debugPanel}
-      </>
     )
   }
 
   /* ── Join form (pre-join) ───────────────────────────────────── */
 
   return (
-    <>
     <div className="container">
       <div className="card">
         <div className="header">
@@ -595,8 +530,6 @@ function ListenerPage() {
         </div>
       </div>
     </div>
-    {debugPanel}
-    </>
   )
 }
 
