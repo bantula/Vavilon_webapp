@@ -138,9 +138,14 @@ function ListenerPage() {
   const initAudioContext = () => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
+      console.log('[iOS-diag] AudioContext CREATED, state:', audioContextRef.current.state)
+    } else {
+      console.log('[iOS-diag] AudioContext EXISTS, state:', audioContextRef.current.state)
     }
     if (audioContextRef.current.state === 'suspended') {
-      audioContextRef.current.resume()
+      const p = audioContextRef.current.resume()
+      p.then(() => console.log('[iOS-diag] initAudioContext resume() RESOLVED, state:', audioContextRef.current.state))
+       .catch(e => console.error('[iOS-diag] initAudioContext resume() REJECTED:', e))
     }
   }
 
@@ -150,12 +155,14 @@ function ListenerPage() {
       return
     }
 
+    console.log('[iOS-diag] handleJoin: SYNC start — gesture token valid here')
     setError('')
     setStatus('Connecting...')
 
     try {
       const response = await fetch(`${config.apiUrl}/api/sessions/${joinCode}`)
       const data = await response.json()
+      console.log('[iOS-diag] handleJoin: AFTER await — gesture token likely expired on iOS')
 
       if (!data.success) {
         setError('Session not found')
@@ -164,6 +171,7 @@ function ListenerPage() {
       }
 
       initAudioContext()
+      console.log('[iOS-diag] handleJoin: AudioContext state after init:', audioContextRef.current?.state)
       setupWebSocket(data.session.id)
     } catch (err) {
       console.error('Error joining session:', err)
@@ -224,6 +232,7 @@ function ListenerPage() {
         break
 
       case 'audio':
+        console.log('[iOS-diag] audio received, length:', payload.audioData?.length)
         queueAudio(payload.audioData)
         break
 
@@ -304,7 +313,9 @@ function ListenerPage() {
     try {
       const ctx = audioContextRef.current
       if (!ctx) { playNextInQueue(); return }
+      console.log('[iOS-diag] playNextInQueue: ctx state BEFORE resume:', ctx.state, '| queue remaining:', audioQueueRef.current.length)
       if (ctx.state === 'suspended') await ctx.resume()
+      console.log('[iOS-diag] playNextInQueue: ctx state AFTER resume:', ctx.state)
 
       const binaryString = atob(audioDataBase64)
       const bytes = new Uint8Array(binaryString.length)
@@ -313,13 +324,15 @@ function ListenerPage() {
       }
 
       const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0))
+      console.log('[iOS-diag] decoded: duration', audioBuffer.duration, '| sampleRate', audioBuffer.sampleRate, '| channels', audioBuffer.numberOfChannels)
       const source = ctx.createBufferSource()
       source.buffer = audioBuffer
       source.connect(ctx.destination)
       source.onended = () => playNextInQueue()
       source.start(0)
+      console.log('[iOS-diag] source.start(0) called at ctx.currentTime:', ctx.currentTime)
     } catch (err) {
-      console.error('Error playing audio:', err)
+      console.error('[iOS-diag] playNextInQueue FAILED:', err.name, err.message, err)
       playNextInQueue()
     }
   }
