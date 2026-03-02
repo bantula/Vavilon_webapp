@@ -708,3 +708,140 @@ body {
 .speaker-logout-btn:hover {
   background: rgba(255, 255, 255, 0.32);
 }
+
+/* ── Audio-only listening view ────────────────────────────────── */
+
+.audio-listen-page {
+  position: relative;
+  max-width: 520px;
+  margin: 0 auto;
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: #f0f2f5;
+  overflow: hidden;
+}
+
+.audio-listen-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+  padding: 32px 24px;
+}
+
+/* The circle orb */
+.audio-listen-orb {
+  width: 200px;
+  height: 200px;
+  border-radius: 50%;
+  background: white;
+  border: 1.5px solid #e9eaf0;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: box-shadow 0.5s ease;
+}
+
+.audio-listen-orb--active {
+  animation: orb-pulse 1.8s ease-out infinite;
+}
+
+@keyframes orb-pulse {
+  0%   { box-shadow: 0 0 0 0   rgba(102, 126, 234, 0.28); }
+  70%  { box-shadow: 0 0 0 32px rgba(102, 126, 234, 0); }
+  100% { box-shadow: 0 0 0 0   rgba(102, 126, 234, 0); }
+}
+
+/* Wave bars inside the orb */
+.audio-wave {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 52px;
+}
+
+.audio-wave-bar {
+  width: 5px;
+  height: 52px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #667eea 0%, #7c5ce0 100%);
+  transform-origin: center;
+  transform: scaleY(0.12);
+}
+
+.audio-wave-bar--idle {
+  animation: wave-idle 2.8s ease-in-out infinite;
+}
+
+.audio-wave-bar--active {
+  animation: wave-active 0.7s ease-in-out infinite alternate;
+}
+
+@keyframes wave-idle {
+  0%, 100% { transform: scaleY(0.12); opacity: 0.35; }
+  50%       { transform: scaleY(0.22); opacity: 0.60; }
+}
+
+@keyframes wave-active {
+  from { transform: scaleY(0.25); }
+  to   { transform: scaleY(1.00); }
+}
+
+/* Label below the orb */
+.audio-listen-label {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #9ca3af;
+  letter-spacing: 0.01em;
+  margin: 0;
+  transition: color 0.4s ease;
+}
+
+.audio-listen-label--speaking {
+  color: #667eea;
+}
+
+/* Secondary status line */
+.audio-listen-sub {
+  font-size: 0.82rem;
+  color: #b0b8c8;
+  margin: 0;
+  text-align: center;
+}
+
+/* Responsive — mirrors chat-container rules */
+@media (max-width: 600px) {
+  .audio-listen-page {
+    max-width: 100%;
+  }
+}
+
+@media (min-width: 601px) {
+  .audio-listen-page {
+    margin-top: 20px;
+    margin-bottom: 20px;
+    height: calc(100vh - 40px);
+    height: calc(100dvh - 40px);
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.15);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .audio-wave-bar--idle,
+  .audio-wave-bar--active {
+    animation: none;
+    transform: scaleY(0.5);
+    opacity: 0.7;
+  }
+  .audio-listen-orb--active {
+    animation: none;
+    box-shadow: 0 0 0 6px rgba(102, 126, 234, 0.18);
+  }
+}

@@ -96,6 +96,80 @@ function TypingIndicator() {
   )
 }
 
+/* ── Audio-only listening view ──────────────────────────────────── */
+
+const WAVE_CONFIGS = [
+  { dur: 0.65, delay: 0.00 },
+  { dur: 0.80, delay: 0.12 },
+  { dur: 0.55, delay: 0.06 },
+  { dur: 0.95, delay: 0.20 },
+  { dur: 0.70, delay: 0.03 },
+]
+
+function AudioListeningView({ isSpeaking, langName, error, status, onLeave, sessionEnded, onReturnHome }) {
+  return (
+    <div className="audio-listen-page">
+      {/* Minimal header — reuses chat-header styles */}
+      <div className="chat-header">
+        <div className="chat-header-left">
+          <GuideAvatar />
+          <div>
+            <div className="chat-header-title">Live Tour</div>
+            <div className="chat-header-lang">{langName}</div>
+          </div>
+        </div>
+        <button className="chat-leave-btn" onClick={onLeave}>Leave</button>
+      </div>
+
+      {error && <div className="chat-error">{error}</div>}
+
+      {/* Center stage */}
+      <div className="audio-listen-stage">
+        <div className={`audio-listen-orb${isSpeaking ? ' audio-listen-orb--active' : ''}`}>
+          <div className="audio-wave">
+            {WAVE_CONFIGS.map((cfg, i) => (
+              <div
+                key={i}
+                className={`audio-wave-bar${isSpeaking ? ' audio-wave-bar--active' : ' audio-wave-bar--idle'}`}
+                style={isSpeaking
+                  ? { animationDuration: `${cfg.dur}s`, animationDelay: `${cfg.delay}s` }
+                  : { animationDelay: `${i * 0.55}s` }
+                }
+              />
+            ))}
+          </div>
+        </div>
+
+        <p className={`audio-listen-label${isSpeaking ? ' audio-listen-label--speaking' : ''}`}>
+          {isSpeaking ? 'Guide is speaking' : 'Listening live'}
+        </p>
+
+        {status && <p className="audio-listen-sub">{status}</p>}
+      </div>
+
+      {/* Session ended overlay — same as chat view */}
+      {sessionEnded && (
+        <div className="session-ended-overlay">
+          <div className="session-ended-card">
+            <div className="session-ended-icon">
+              <svg width="56" height="56" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="28" cy="28" r="28" fill="#667eea" opacity="0.1" />
+                <circle cx="28" cy="28" r="20" fill="#667eea" opacity="0.15" />
+                <path d="M22 28l4 4 8-8" stroke="#667eea" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </div>
+            <h2 className="session-ended-title">Thank you for joining the tour!</h2>
+            <p className="session-ended-sub">This session has now ended. We hope you enjoyed the experience.</p>
+            <button className="session-ended-btn" onClick={onReturnHome}>
+              Return to Home
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 /* ── Component ──────────────────────────────────────────────────── */
 
 function ListenerPage() {
@@ -378,10 +452,25 @@ function ListenerPage() {
     }
   }
 
-  /* ── Joined: Chat conversation view ─────────────────────────── */
+  /* ── Joined: render audio-only or chat depending on language match ── */
 
   if (isJoined) {
     const langName = LANGUAGES.find(l => l.code === selectedLanguage)?.name || selectedLanguage
+
+    // Same language as speaker → audio-focused UI, no subtitles needed
+    if (isBypassMode) {
+      return (
+        <AudioListeningView
+          isSpeaking={showIndicator}
+          langName={langName}
+          error={error}
+          status={status}
+          onLeave={handleLeave}
+          sessionEnded={sessionEnded}
+          onReturnHome={handleReturnHome}
+        />
+      )
+    }
 
     return (
       <div className="chat-container">
