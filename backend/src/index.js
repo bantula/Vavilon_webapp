@@ -18,6 +18,8 @@ const broadcastRoutes = require('./routes/broadcast');
 const eventsRoutes = require('./routes/events');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
+const paytenRoutes = require('./routes/payten');
+const leadsRoutes  = require('./routes/leads');
 const { setupWebSocket } = require('./websocket/wsHandler');
 
 const app = express();
@@ -26,10 +28,15 @@ const server = http.createServer(app);
 // Middleware
 app.use(cors({
   origin: [
+    'http://localhost:3000',
+    'http://localhost:3001',
     'http://localhost:5173',
     'https://green-pond-05766a403.1.azurestaticapps.net',
+    'https://delightful-beach-0f44c2303.azurestaticapps.net',
     'https://vavilonapp.rs',
-    'https://www.vavilonapp.rs'
+    'https://www.vavilonapp.rs',
+    'https://vavilonsolutions.rs',
+    'https://www.vavilonsolutions.rs',
   ],
   credentials: true
 }));
@@ -41,6 +48,8 @@ app.use('/api/broadcast', broadcastRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api', paytenRoutes);
+app.use('/api', leadsRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

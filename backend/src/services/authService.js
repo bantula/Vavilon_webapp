@@ -104,4 +104,13 @@ async function checkAccess(username) {
   };
 }
 
-module.exports = { upsertGuide, getGuide, listGuides, checkAccess };
+/**
+ * Retrieve an agency's subscription record by normalised agency name.
+ * Used by the auth route to gate guide access by subscription status.
+ */
+async function getAgencySubscription(agencyName) {
+  const data = await client.get(`agency:${agencyName}`);
+  return data ? JSON.parse(data) : null;
+}
+
+module.exports = { upsertGuide, getGuide, listGuides, checkAccess, getAgencySubscription };
