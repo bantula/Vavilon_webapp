@@ -12,7 +12,7 @@ const {
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 
 // Track all WebSocket connections
-const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage, traceId, seqNo }
+const connections = new Map(); // connectionId -> { ws, sessionId, role, language, sourceLanguage, traceId, seqNo, lastAudioAt, lastPong }
 
 
 // Structured log helper
@@ -66,7 +66,14 @@ function setupWebSocket(server) {
       language: null,
       sourceLanguage: null,
       traceId: null,
-      seqNo: 0
+      seqNo: 0,
+      lastAudioAt: null,       // updated on every audio_chunk; null = never sent audio
+      lastPong: Date.now()     // updated on pong receipt; initialized to now for fair first window
+    });
+
+    ws.on('pong', () => {
+      const conn = connections.get(connectionId);
+      if (conn) conn.lastPong = Date.now();
     });
 
     ws.on('message', async (message) => {
@@ -87,6 +94,30 @@ function setupWebSocket(server) {
       handleDisconnect(connectionId);
     });
   });
+
+  // Ping/pong heartbeat: detect dead connections without waiting for TCP timeout (60-90s)
+  const PING_INTERVAL_MS = 30000; // send ping every 30s
+  const PONG_TIMEOUT_MS  = 45000; // terminate if no pong within 45s
+
+  const pingInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [connId, conn] of connections) {
+      if (conn.ws.readyState !== WebSocket.OPEN) continue;
+      if (now - conn.lastPong > PONG_TIMEOUT_MS) {
+        slog('warn', 'node', 'ws_pong_timeout', {
+          connectionId: connId,
+          role: conn.role,
+          sessionId: conn.sessionId,
+          lastPongAgoMs: now - conn.lastPong
+        });
+        conn.ws.terminate(); // fires 'close' → handleDisconnect() cleans up normally
+        continue;
+      }
+      conn.ws.ping();
+    }
+  }, PING_INTERVAL_MS);
+
+  pingInterval.unref(); // don't prevent graceful Node shutdown
 
   slog('info', 'node', 'ws_ready', { path: '/ws' });
 }
@@ -122,6 +153,8 @@ async function handleMessage(connectionId, data) {
 function handleBinaryMessage(connectionId, buffer) {
   const conn = connections.get(connectionId);
   if (!conn || conn.role !== 'speaker') return;
+
+  conn.lastAudioAt = Date.now();
 
   // Binary messages bypass the JSON protocol — log for visibility
   slog('warn', 'node', 'binary_audio_received', {
@@ -305,6 +338,7 @@ async function handleAudioChunk(connectionId, payload) {
   if (!conn || conn.role !== 'speaker') return;
 
   conn.seqNo++;
+  conn.lastAudioAt = Date.now();
 
   // Forward to AI service for translation (single canonical path)
   forwardAudioToAI(connectionId, conn.sessionId, payload.audioData, conn);
@@ -547,5 +581,6 @@ function getSessionListenerLanguages(sessionId) {
 module.exports = {
   setupWebSocket,
   broadcastToListeners,
-  getSessionListenerLanguages
+  getSessionListenerLanguages,
+  connections
 };

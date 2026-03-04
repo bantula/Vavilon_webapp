@@ -82,9 +82,9 @@ async function createSession() {
                          'sr', 'mk', 'bg', 'hu', 'ro', 'hr', 'sl', 'sk', 'pl', 'uk']
   };
 
-  // Store in Redis with 24 hour expiration
-  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
-  await client.setEx(`code:${joinCode}`, 86400, sessionId);
+  // Store in Redis with 13 hour expiration (12h max session + 1h grace)
+  await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
+  await client.setEx(`code:${joinCode}`, 46800, sessionId);
 
   console.log(`✓ Session created: ${sessionId} | Code: ${joinCode}`);
 
@@ -137,7 +137,7 @@ async function addListener(sessionId, connectionId, language) {
     session.listeners[language].push(connectionId);
   }
 
-  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
+  await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
   console.log(`✓ Listener ${connectionId} joined session ${sessionId} (${language})`);
 
   return true;
@@ -159,7 +159,7 @@ async function removeListener(sessionId, connectionId, language) {
     }
   }
 
-  await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
+  await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
   console.log(`✓ Listener ${connectionId} left session ${sessionId}`);
 }
 
@@ -201,7 +201,7 @@ async function setSpeakerConnected(sessionId, connected) {
   const session = await getSession(sessionId);
   if (session) {
     session.speakerConnected = connected;
-    await client.setEx(`session:${sessionId}`, 86400, JSON.stringify(session));
+    await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
   }
 }
 
@@ -245,6 +245,24 @@ async function getSessionStats(sessionId) {
   };
 }
 
+/**
+ * Get all active sessions from Redis (used by watchdog)
+ */
+async function getAllActiveSessions() {
+  try {
+    const keys = await client.keys('session:*');
+    const sessions = [];
+    for (const key of keys) {
+      const data = await client.get(key);
+      if (data) sessions.push(JSON.parse(data));
+    }
+    return sessions;
+  } catch (err) {
+    console.error('Error scanning sessions:', err);
+    return [];
+  }
+}
+
 module.exports = {
   createSession,
   getSession,
@@ -254,5 +272,6 @@ module.exports = {
   getSessionListenerLanguages,
   setSpeakerConnected,
   endSession,
-  getSessionStats
+  getSessionStats,
+  getAllActiveSessions
 };

@@ -341,6 +341,15 @@ def get_trace(trace_id):
     return jsonify({'traceId': trace_id, 'count': len(logs), 'logs': logs[-n:]})
 
 
+@app.route('/sessions', methods=['GET'])
+def list_sessions():
+    """List active session IDs — used for zombie detection and observability."""
+    return jsonify({
+        'count': len(sessions),
+        'session_ids': list(sessions.keys())
+    })
+
+
 @app.route('/routes', methods=['GET'])
 def list_routes():
     """List all registered routes for quick verification."""

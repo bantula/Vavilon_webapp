@@ -20,7 +20,8 @@ const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const paytenRoutes = require('./routes/payten');
 const leadsRoutes  = require('./routes/leads');
-const { setupWebSocket } = require('./websocket/wsHandler');
+const { setupWebSocket, connections } = require('./websocket/wsHandler');
+const { startWatchdog } = require('./services/watchdogService');
 
 const app = express();
 const server = http.createServer(app);
@@ -58,6 +59,7 @@ app.get('/health', (req, res) => {
 
 // Setup WebSocket
 setupWebSocket(server);
+startWatchdog(connections);
 
 const PORT = process.env.PORT || 3000;
 
