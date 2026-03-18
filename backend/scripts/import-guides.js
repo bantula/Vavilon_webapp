@@ -4,8 +4,8 @@
  *
  * Reads a CSV file and imports/updates tour guide records in Redis.
  *
- * Usage:
- *   node scripts/import-guides.js [path-to-csv]
+ * Usage (from the backend/ directory):
+ *   node --env-file=.env scripts/import-guides.js [path-to-csv]
  *
  * Default CSV path: ./data/guides.csv
  *
@@ -37,7 +37,7 @@ const client = redis.createClient({
   url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
   password: process.env.REDIS_PASSWORD,
   socket: {
-    tls: process.env.REDIS_URL ? true : false,
+    tls: !!process.env.REDIS_URL,
     rejectUnauthorized: false
   }
 });
