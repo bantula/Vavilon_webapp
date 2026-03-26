@@ -22,6 +22,8 @@ const paytenRoutes = require('./routes/payten');
 const leadsRoutes  = require('./routes/leads');
 const { setupWebSocket, connections } = require('./websocket/wsHandler');
 const { startWatchdog } = require('./services/watchdogService');
+const { execFile } = require('child_process');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -55,6 +57,16 @@ app.use('/api', leadsRoutes);
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'vavilon-backend' });
+});
+
+// Auto-import guides from guides.csv into Redis on every startup
+const importScript = path.join(__dirname, '..', 'scripts', 'import-guides.js');
+execFile(process.execPath, [importScript], { env: process.env }, (err, stdout, stderr) => {
+  if (err) {
+    console.error('Guide import failed:', stderr || err.message);
+  } else {
+    console.log('✓ Guides imported from CSV\n' + stdout.trim());
+  }
 });
 
 // Setup WebSocket
