@@ -8,44 +8,43 @@ on:
 jobs:
   deploy-backend:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./backend
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-      
+          cache-dependency-path: package-lock.json
+
       - name: Install dependencies
-        run: npm ci --no-workspaces
-      
+        run: npm ci
+
       - name: Create deployment package
+        working-directory: ./backend
         run: |
           python3 -c "
           import zipfile, os
           if os.path.exists('deploy.zip'): os.remove('deploy.zip')
           with zipfile.ZipFile('deploy.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
               zf.write('package.json', 'package.json')
-              zf.write('package-lock.json', 'package-lock.json')
-              for root, dirs, files in os.walk('src'):
-                  for f in files:
-                      fp = os.path.join(root, f)
-                      zf.write(fp, fp.replace(os.sep, '/'))
+              for folder in ['src', 'scripts', 'data']:
+                  for root, dirs, files in os.walk(folder):
+                      for f in files:
+                          fp = os.path.join(root, f)
+                          zf.write(fp, fp.replace(os.sep, '/'))
           "
       
       - name: Deploy to Azure Web App
         env:
           PUBLISH_PROFILE: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        working-directory: ./backend
         run: |
           # Extract deployment credentials from publish profile
           USERNAME=$(echo "$PUBLISH_PROFILE" | grep -oP 'userName="[^"]*' | grep -oP '".*' | tr -d '"' | head -1)
           PASSWORD=$(echo "$PUBLISH_PROFILE" | grep -oP 'userPWD="[^"]*' | grep -oP '".*' | tr -d '"' | head -1)
-          
+
           # Deploy using Kudu API
           curl -X POST \
             -u "$USERNAME:$PASSWORD" \
