@@ -3,32 +3,7 @@ const router = express.Router();
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
-const redis = require('redis');
-
-// ─── Redis client (same pattern as authService.js) ───────────────────────────
-const redisClient = redis.createClient({
-  url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    tls: process.env.REDIS_URL ? true : false,
-    rejectUnauthorized: false,
-    reconnectStrategy: (retries) => {
-      if (retries > 10) return new Error('Redis reconnect limit exceeded');
-      return Math.min(retries * 50, 2000);
-    }
-  }
-});
-
-redisClient.on('error', (err) => console.error('Payten Redis error:', err));
-redisClient.on('ready', () => console.log('✓ Payten Redis client ready'));
-
-(async () => {
-  try {
-    await redisClient.connect();
-  } catch (err) {
-    console.error('Payten Redis connect failed:', err);
-  }
-})();
+const { client: redisClient } = require('../redisClient');
 
 // ─── Redis helpers ─────────────────────────────────────────────────────────
 

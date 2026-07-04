@@ -1,29 +1,4 @@
-const redis = require('redis');
-
-// Redis client (mirrors sessionService.js pattern)
-const client = redis.createClient({
-  url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    tls: process.env.REDIS_URL ? true : false,
-    rejectUnauthorized: false,
-    reconnectStrategy: (retries) => {
-      if (retries > 10) return new Error('Redis reconnect limit exceeded');
-      return Math.min(retries * 50, 2000);
-    }
-  }
-});
-
-client.on('error', (err) => console.error('Auth Redis error:', err));
-client.on('ready', () => console.log('✓ Auth Redis client ready'));
-
-(async () => {
-  try {
-    await client.connect();
-  } catch (err) {
-    console.error('Auth Redis connect failed:', err);
-  }
-})();
+const { client, scanKeys } = require('../redisClient');
 
 /**
  * Get today's date as YYYY-MM-DD in server local time.
@@ -69,7 +44,7 @@ async function getGuide(username) {
  * List all guides (scans Redis for guide:* keys).
  */
 async function listGuides() {
-  const keys = await client.keys('guide:*');
+  const keys = await scanKeys('guide:*');
   if (!keys.length) return [];
 
   const values = await Promise.all(keys.map(k => client.get(k)));

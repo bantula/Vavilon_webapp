@@ -7,7 +7,9 @@ const { upsertGuide, listGuides } = require('../services/authService');
  * Set ADMIN_SECRET env var on the server. Pass it as X-Admin-Key header.
  */
 function requireAdminKey(req, res, next) {
-  const secret = process.env.ADMIN_SECRET;
+  // Accept either env name — historically admin routes used ADMIN_SECRET and
+  // the leads route used ADMIN_KEY; both are honoured so a single value works.
+  const secret = process.env.ADMIN_SECRET || process.env.ADMIN_KEY;
   if (!secret) {
     // If no secret configured, reject all requests for safety
     return res.status(503).json({ success: false, error: 'admin_not_configured' });
@@ -75,7 +77,7 @@ router.post('/guides', async (req, res) => {
     const { guide, isNew } = await upsertGuide({
       firstName,
       lastName,
-      username: username.toLowerCase(),
+      username: username.trim().toLowerCase(),
       email,
       phone,
       accessWindows

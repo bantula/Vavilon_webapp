@@ -12,9 +12,9 @@
  */
 
 const express = require('express');
-const { createClient } = require('redis');
-const { BlobServiceClient, AppendBlobClient } = require('@azure/storage-blob');
+const { BlobServiceClient } = require('@azure/storage-blob');
 const { v4: uuidv4 } = require('uuid');
+const { client: redisClient } = require('../redisClient');
 
 const router = express.Router();
 
@@ -23,29 +23,38 @@ const router = express.Router();
 const CONTAINER = 'leads';
 const BLOB_NAME  = 'leads.jsonl';
 
-const blobServiceClient = BlobServiceClient.fromConnectionString(
-  process.env.AZURE_STORAGE_CONNECTION_STRING
-);
-const containerClient = blobServiceClient.getContainerClient(CONTAINER);
+// Lazily build the container client. Doing this at require-time with a missing
+// or malformed AZURE_STORAGE_CONNECTION_STRING throws synchronously, which would
+// crash the WHOLE backend (auth, sessions, everything) on boot. Lazy init keeps
+// any blob misconfiguration contained to the /leads endpoints.
+let _containerClient = null;
+function getContainerClient() {
+  if (!_containerClient) {
+    const connStr = process.env.AZURE_STORAGE_CONNECTION_STRING;
+    if (!connStr) {
+      throw new Error('AZURE_STORAGE_CONNECTION_STRING is not set');
+    }
+    _containerClient = BlobServiceClient
+      .fromConnectionString(connStr)
+      .getContainerClient(CONTAINER);
+  }
+  return _containerClient;
+}
 
 async function ensureAppendBlob() {
-  const appendBlobClient = containerClient.getAppendBlobClient(BLOB_NAME);
-  try {
-    await appendBlobClient.createIfNotExists();
-  } catch (err) {
-    console.error('Blob init error:', err.message);
-  }
+  const appendBlobClient = getContainerClient().getAppendBlobClient(BLOB_NAME);
+  await appendBlobClient.createIfNotExists();
   return appendBlobClient;
 }
 
 async function appendLead(lead) {
-  const appendBlobClient = containerClient.getAppendBlobClient(BLOB_NAME);
+  const appendBlobClient = getContainerClient().getAppendBlobClient(BLOB_NAME);
   const line = JSON.stringify(lead) + '\n';
   await appendBlobClient.appendBlock(line, Buffer.byteLength(line));
 }
 
 async function readAllLeads() {
-  const blobClient = containerClient.getBlobClient(BLOB_NAME);
+  const blobClient = getContainerClient().getBlobClient(BLOB_NAME);
   const download = await blobClient.download();
   const chunks = [];
   for await (const chunk of download.readableStreamBody) {
@@ -59,30 +68,13 @@ async function readAllLeads() {
     .reverse(); // newest first
 }
 
-// Init blob on startup
-ensureAppendBlob().then(() => console.log('✓ Leads blob storage ready'));
+// Init blob on startup — best effort. A failure here (e.g. missing connection
+// string) must NOT take down the process; /leads will surface the error per-request.
+ensureAppendBlob()
+  .then(() => console.log('✓ Leads blob storage ready'))
+  .catch((err) => console.error('Leads blob init skipped:', err.message));
 
-// ── Redis client (cache only) ─────────────────────────────────────────────────
-
-const redisClient = createClient({
-  url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    tls: !!process.env.REDIS_URL,
-    rejectUnauthorized: false,
-    reconnectStrategy: (retries) => {
-      if (retries > 10) return new Error('Redis reconnect limit exceeded');
-      return Math.min(retries * 50, 2000);
-    },
-  },
-});
-
-redisClient.on('error', (err) => console.error('Leads Redis error:', err.message));
-redisClient.on('ready', () => console.log('✓ Leads Redis client ready'));
-
-(async () => {
-  try { await redisClient.connect(); } catch (err) { console.error('Leads Redis connect failed:', err.message); }
-})();
+// Redis is a best-effort cache only; the shared client is used.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -136,7 +128,7 @@ router.post('/leads', async (req, res) => {
 // ── GET /api/admin/leads ──────────────────────────────────────────────────────
 
 router.get('/admin/leads', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
+  const adminKey = process.env.ADMIN_KEY || process.env.ADMIN_SECRET;
   if (!adminKey || req.headers['x-admin-key'] !== adminKey) {
     return res.status(401).json({ error: 'Unauthorized' });
   }

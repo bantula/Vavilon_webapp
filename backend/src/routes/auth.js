@@ -35,7 +35,8 @@ router.post('/login', async (req, res) => {
         guide: {
           firstName: result.guide.firstName,
           lastName: result.guide.lastName,
-          phone: result.guide.phone
+          phone: result.guide.phone,
+          username: result.guide.username
         },
         scheduledWindows: result.scheduledWindows
       });

@@ -46,7 +46,11 @@ client.on('error', (err) => console.error('Redis error:', err.message));
 
 // ── CSV parsing (no external dependencies) ────────────────────────────────
 function parseCsv(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  // Strip a UTF-8 BOM (common in Excel/Windows exports) so the first header
+  // isn't read as "﻿name", which would fail the required-column check and
+  // abort the whole import.
+  const clean = text.replace(/^﻿/, '');
+  const lines = clean.split(/\r?\n/).filter(l => l.trim());
   if (lines.length < 2) throw new Error('CSV must have a header row and at least one data row');
 
   const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
@@ -72,9 +76,10 @@ function validateDate(dateStr, label) {
 // ── Main ──────────────────────────────────────────────────────────────────
 async function main() {
   if (!fs.existsSync(csvPath)) {
-    console.error(`CSV file not found: ${csvPath}`);
-    console.error('Copy guides_template.csv to guides.csv, fill in the data, then run this script.');
-    process.exit(1);
+    // Not an error: on the server guides may already live in Redis and no CSV
+    // is shipped. Skip cleanly so startup auto-import stays quiet.
+    console.log(`No guides CSV at ${csvPath} — skipping import (existing Redis guides untouched).`);
+    process.exit(0);
   }
 
   const text = fs.readFileSync(csvPath, 'utf8');

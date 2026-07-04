@@ -1,61 +1,34 @@
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const QRCode = require('qrcode');
-const redis = require('redis');
-
-// Redis client for session storage with connection resilience
-const client = redis.createClient({
-  url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    tls: process.env.REDIS_URL ? true : false,
-    rejectUnauthorized: false,
-    reconnectStrategy: (retries) => {
-      if (retries > 10) {
-        console.error('Redis reconnect failed after 10 attempts');
-        return new Error('Redis reconnect limit exceeded');
-      }
-      const delay = Math.min(retries * 50, 2000);
-      console.log(`Redis reconnecting in ${delay}ms (attempt ${retries})`);
-      return delay;
-    }
-  }
-});
-
-client.on('error', (err) => {
-  console.error('Redis client error:', err);
-});
-
-client.on('reconnecting', () => {
-  console.warn('Redis client reconnecting...');
-});
-
-client.on('ready', () => {
-  console.log('✓ Redis client ready');
-});
-
-client.on('connect', () => {
-  console.log('✓ Connected to Redis');
-});
-
-// Connect to Redis
-(async () => {
-  try {
-    await client.connect();
-  } catch (err) {
-    console.error('Failed to connect to Redis:', err);
-  }
-})();
+const { client, scanKeys } = require('../redisClient');
 
 /**
- * Generate a short 6-character join code
+ * Generate a short 6-character join code using a CSPRNG (crypto) instead of
+ * Math.random(). Unbiased selection over the 32-char alphabet.
  */
 function generateJoinCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Excluding confusing chars
+  const bytes = crypto.randomBytes(6);
   let code = '';
   for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
+    // 256 % 32 === 0, so modulo introduces no bias for this alphabet.
+    code += chars.charAt(bytes[i] % chars.length);
   }
   return code;
+}
+
+/**
+ * Generate a join code that is not already in use, retrying on collision.
+ */
+async function generateUniqueJoinCode() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateJoinCode();
+    const exists = await client.get(`code:${code}`);
+    if (!exists) return code;
+  }
+  // Extremely unlikely; fall back to a longer code to guarantee uniqueness.
+  return generateJoinCode() + generateJoinCode().slice(0, 2);
 }
 
 /**
@@ -63,7 +36,7 @@ function generateJoinCode() {
  */
 async function createSession() {
   const sessionId = uuidv4();
-  const joinCode = generateJoinCode();
+  const joinCode = await generateUniqueJoinCode();
 
   // Generate QR code
   const joinUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/join?code=${joinCode}`;
@@ -250,7 +223,7 @@ async function getSessionStats(sessionId) {
  */
 async function getAllActiveSessions() {
   try {
-    const keys = await client.keys('session:*');
+    const keys = await scanKeys('session:*');
     const sessions = [];
     for (const key of keys) {
       const data = await client.get(key);
