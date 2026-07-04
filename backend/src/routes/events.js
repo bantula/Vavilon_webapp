@@ -3,8 +3,12 @@ const router = express.Router();
 const axios = require('axios');
 const { broadcastToListeners } = require('../websocket/wsHandler');
 const { getSessionListenerLanguages } = require('../services/sessionService');
+const { serviceHeaders, requireServiceKey } = require('../serviceAuth');
 
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
+
+// Only the AI service may post events (segment_finalized / tts_ready).
+router.use(requireServiceKey);
 
 // TTS guard: track expected TTS per segment
 // Map<segmentId, { sessionId, expectedLanguages: Set, received: Set, timer: NodeJS.Timeout }>
@@ -122,7 +126,7 @@ router.post('/', async (req, res) => {
           sessionId,
           segmentId,
           translations: ttsTranslations
-        }, { timeout: 5000 })
+        }, { headers: serviceHeaders(), timeout: 5000 })
           .then((resp) => {
             slog('info', 'generate_tts_sent', {
               sessionId,

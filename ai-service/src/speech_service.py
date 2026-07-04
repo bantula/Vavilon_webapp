@@ -13,6 +13,15 @@ import traceback
 from typing import Dict, Callable, Optional
 
 
+# Shared secret attached to callbacks into the Node backend (/api/events).
+# Matches SERVICE_SECRET in app.py and backend/src/serviceAuth.js.
+SERVICE_SECRET = os.getenv('SERVICE_SECRET')
+
+
+def _service_headers():
+    return {'X-Service-Key': SERVICE_SECRET} if SERVICE_SECRET else {}
+
+
 def _slog(level, step, **kwargs):
     entry = {
         'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
@@ -1027,6 +1036,7 @@ class TranslationSession:
             resp = requests.post(
                 f'{self.node_backend_url}/api/events',
                 json=event,
+                headers=_service_headers(),
                 timeout=5
             )
             
@@ -1072,7 +1082,7 @@ class TranslationSession:
                           audio_size_kb=round(audio_size_kb, 2),
                           url=url)
                 
-                resp = requests.post(url, json=event, timeout=5.0)
+                resp = requests.post(url, json=event, headers=_service_headers(), timeout=5.0)
                 
                 self._log('info', 'tts_emit_success',
                           segment_id=segment_id,

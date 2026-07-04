@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const { broadcastToListeners } = require('../websocket/wsHandler');
+const { requireServiceKey } = require('../serviceAuth');
+
+// Internal service endpoint — restrict to callers holding the shared secret.
+router.use(requireServiceKey);
 
 /**
  * POST /api/broadcast

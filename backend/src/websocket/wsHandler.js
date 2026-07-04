@@ -8,6 +8,7 @@ const {
   getListenersByLanguage,
   setSpeakerConnected
 } = require('../services/sessionService');
+const { serviceHeaders } = require('../serviceAuth');
 
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000';
 
@@ -250,7 +251,7 @@ async function handleStartSpeaking(connectionId, payload) {
       traceId: conn.traceId,
       sourceLanguage: conn.sourceLanguage,
       targetLanguages: targetLanguages || ['es', 'fr', 'de']
-    }, { timeout: 15000 });
+    }, { headers: serviceHeaders(), timeout: 15000 });
 
     slog('info', 'node', 'ai_session_started', {
       sessionId: conn.sessionId,
@@ -301,7 +302,7 @@ async function handleStopSpeaking(connectionId) {
     sessionId: conn.sessionId,
     traceId: conn.traceId,
     graceful: true  // Close stream first to ensure final segments are processed
-  }, { timeout: 8000 })  // Increased timeout to accommodate graceful stop (2s grace period)
+  }, { headers: serviceHeaders(), timeout: 8000 })  // Increased timeout to accommodate graceful stop (2s grace period)
     .then(() => {
       slog('info', 'node', 'ai_session_ended', {
         sessionId: conn.sessionId,
@@ -376,7 +377,7 @@ async function forwardAudioToAI(connectionId, sessionId, audioData, conn) {
     await axios.post(`${AI_SERVICE_URL}/process-audio`, {
       sessionId, traceId, seqNo,
       audioData: base64Audio
-    }, { timeout: 10000 });  // Increased from 5000ms to 10000ms (Phase 2 fix)
+    }, { headers: serviceHeaders(), timeout: 10000 });  // Increased from 5000ms to 10000ms (Phase 2 fix)
   } catch (error) {
     const status = error.response?.status;
 
@@ -510,7 +511,7 @@ async function handleSpeakerDisconnect(connectionId) {
   axios.post(`${AI_SERVICE_URL}/end-session`, {
     sessionId: conn.sessionId,
     traceId: conn.traceId
-  }, { timeout: 5000 })
+  }, { headers: serviceHeaders(), timeout: 5000 })
     .then(() => {
       slog('info', 'node', 'ai_session_ended_disconnect', {
         sessionId: conn.sessionId,

@@ -24,6 +24,12 @@ AZURE_SPEECH_REGION = os.getenv('AZURE_SPEECH_REGION')
 NODE_BACKEND_URL = os.getenv('NODE_BACKEND_URL', 'http://localhost:3000')
 DEBUG = os.getenv('DEBUG', 'false').lower() == 'true'
 
+# Shared secret for service-to-service auth with the Node backend. When set,
+# every endpoint except /health requires a matching X-Service-Key header. Leaving
+# it unset keeps the service open (fail-open) so the secret can be rolled out
+# without downtime. See backend/src/serviceAuth.js for the counterpart.
+SERVICE_SECRET = os.getenv('SERVICE_SECRET')
+
 # ── Structured logging ──────────────────────────────────────────────
 
 def slog(level, step, **kwargs):
@@ -76,6 +82,22 @@ sessions: dict[str, TranslationSession] = {}
 
 if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
     slog('error', 'startup', msg='AZURE_SPEECH_KEY and AZURE_SPEECH_REGION not set!')
+
+
+# ── Service auth ────────────────────────────────────────────────────
+
+@app.before_request
+def _require_service_key():
+    # /health stays open for liveness/monitoring; CORS preflight must pass.
+    if request.method == 'OPTIONS' or request.path == '/health':
+        return None
+    if not SERVICE_SECRET:
+        return None  # enforcement disabled until SERVICE_SECRET is configured
+    if request.headers.get('X-Service-Key') != SERVICE_SECRET:
+        slog('warn', 'unauthorized_request', path=request.path,
+             remote=request.remote_addr)
+        return jsonify({'error': 'unauthorized'}), 401
+    return None
 
 
 # ── Routes ──────────────────────────────────────────────────────────
