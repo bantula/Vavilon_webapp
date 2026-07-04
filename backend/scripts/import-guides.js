@@ -2,7 +2,10 @@
 /**
  * import-guides.js
  *
- * Reads a CSV file and imports/updates tour guide records in Redis.
+ * Reads a CSV file and writes the guide records to backend/data/guides.json,
+ * merging with any guides already there. If AZURE_STORAGE_CONNECTION_STRING is
+ * set, it also uploads the result to Blob Storage (container `guides`,
+ * blob `guides.json`) — the source of truth the backend loads at startup.
  *
  * Usage (from the backend/ directory):
  *   node --env-file=.env scripts/import-guides.js [path-to-csv]
@@ -13,42 +16,20 @@
  *   name, surname, username, email, phone, access_start_date, access_end_date
  *
  * Multiple access windows per guide: add extra rows with the same username.
- * The script merges all date ranges for a given username into one guide record.
- *
- * Example CSV:
- *   name,surname,username,email,phone,access_start_date,access_end_date
- *   John,Doe,john.doe.1234,john@agency.com,+381601234567,2026-10-06,2026-10-08
- *   John,Doe,john.doe.1234,john@agency.com,+381601234567,2026-10-15,2026-10-17
- *   Jane,Smith,jane.smith.5678,jane@agency.com,+381609876543,2026-10-06,2026-10-08
- *
- * Environment variables (same as backend):
- *   REDIS_URL      - Azure Redis hostname (without protocol or port)
- *   REDIS_PASSWORD - Redis password
  */
 
 const fs = require('fs');
 const path = require('path');
-const redis = require('redis');
 
 const csvPath = process.argv[2] || path.join(__dirname, '..', 'data', 'guides.csv');
+const jsonPath = path.join(__dirname, '..', 'data', 'guides.json');
 
-// ── Redis ──────────────────────────────────────────────────────────────────
-const client = redis.createClient({
-  url: process.env.REDIS_URL ? `redis://${process.env.REDIS_URL}:6380` : 'redis://localhost:6379',
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    tls: !!process.env.REDIS_URL,
-    rejectUnauthorized: false
-  }
-});
-
-client.on('error', (err) => console.error('Redis error:', err.message));
+const CONTAINER = 'guides';
+const BLOB_NAME = 'guides.json';
 
 // ── CSV parsing (no external dependencies) ────────────────────────────────
 function parseCsv(text) {
-  // Strip a UTF-8 BOM (common in Excel/Windows exports) so the first header
-  // isn't read as "﻿name", which would fail the required-column check and
-  // abort the whole import.
+  // Strip a UTF-8 BOM (common in Excel/Windows exports).
   const clean = text.replace(/^﻿/, '');
   const lines = clean.split(/\r?\n/).filter(l => l.trim());
   if (lines.length < 2) throw new Error('CSV must have a header row and at least one data row');
@@ -73,13 +54,35 @@ function validateDate(dateStr, label) {
   }
 }
 
+function loadExisting() {
+  if (fs.existsSync(jsonPath)) {
+    try { return JSON.parse(fs.readFileSync(jsonPath, 'utf8')); }
+    catch { return []; }
+  }
+  return [];
+}
+
+async function uploadToBlob(guides) {
+  const connStr = process.env.AZURE_STORAGE_CONNECTION_STRING;
+  if (!connStr) {
+    console.log('AZURE_STORAGE_CONNECTION_STRING not set — wrote local file only.');
+    return;
+  }
+  const { BlobServiceClient } = require('@azure/storage-blob');
+  const container = BlobServiceClient.fromConnectionString(connStr).getContainerClient(CONTAINER);
+  await container.createIfNotExists();
+  const data = JSON.stringify(guides, null, 2);
+  await container.getBlockBlobClient(BLOB_NAME).upload(data, Buffer.byteLength(data), {
+    blobHTTPHeaders: { blobContentType: 'application/json' }
+  });
+  console.log('✓ Uploaded guides.json to Blob.');
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 async function main() {
   if (!fs.existsSync(csvPath)) {
-    // Not an error: on the server guides may already live in Redis and no CSV
-    // is shipped. Skip cleanly so startup auto-import stays quiet.
-    console.log(`No guides CSV at ${csvPath} — skipping import (existing Redis guides untouched).`);
-    process.exit(0);
+    console.error(`CSV file not found: ${csvPath}`);
+    process.exit(1);
   }
 
   const text = fs.readFileSync(csvPath, 'utf8');
@@ -91,10 +94,11 @@ async function main() {
     process.exit(1);
   }
 
-  // Merge rows with same username
-  const guideMap = new Map();
+  // Start from existing guides so CSV rows update rather than wipe.
+  const guideMap = new Map(loadExisting().map(g => [g.username, g]));
+
   for (const row of rows) {
-    const username = row.username.toLowerCase();
+    const username = row.username.trim().toLowerCase();
     if (!username) { console.warn('Skipping row with empty username'); continue; }
 
     try {
@@ -104,7 +108,6 @@ async function main() {
       console.error(`Row for ${username}: ${err.message}`);
       process.exit(1);
     }
-
     if (row.access_start_date > row.access_end_date) {
       console.error(`Row for ${username}: access_start_date must be <= access_end_date`);
       process.exit(1);
@@ -112,59 +115,29 @@ async function main() {
 
     if (!guideMap.has(username)) {
       guideMap.set(username, {
-        firstName: row.name,
-        lastName: row.surname,
-        username,
-        email: row.email,
-        phone: row.phone,
-        accessWindows: []
+        firstName: row.name, lastName: row.surname, username,
+        email: row.email, phone: row.phone, accessWindows: [],
+        createdAt: new Date().toISOString()
       });
     }
-
-    guideMap.get(username).accessWindows.push({
-      startDate: row.access_start_date,
-      endDate: row.access_end_date
-    });
+    const guide = guideMap.get(username);
+    guide.firstName = row.name;
+    guide.lastName = row.surname;
+    guide.email = row.email;
+    guide.phone = row.phone;
+    guide.updatedAt = new Date().toISOString();
+    if (!Array.isArray(guide.accessWindows)) guide.accessWindows = [];
+    guide.accessWindows.push({ startDate: row.access_start_date, endDate: row.access_end_date });
   }
 
-  if (guideMap.size === 0) {
-    console.error('No valid guide rows found in CSV.');
-    process.exit(1);
-  }
+  const guides = [...guideMap.values()].sort((a, b) => a.username.localeCompare(b.username));
 
-  await client.connect();
-  console.log(`\nImporting ${guideMap.size} guide(s)...\n`);
+  fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
+  fs.writeFileSync(jsonPath, JSON.stringify(guides, null, 2) + '\n');
+  console.log(`✓ Wrote ${guides.length} guide(s) to ${jsonPath}`);
 
-  let created = 0;
-  let updated = 0;
-
-  for (const [username, guide] of guideMap) {
-    const key = `guide:${username}`;
-    const existing = await client.get(key);
-    const isNew = !existing;
-
-    const record = {
-      ...(existing ? JSON.parse(existing) : {}),
-      ...guide,
-      updatedAt: new Date().toISOString(),
-      ...(isNew ? { createdAt: new Date().toISOString() } : {})
-    };
-
-    await client.set(key, JSON.stringify(record));
-
-    const status = isNew ? '+ CREATED' : '~ UPDATED';
-    const windows = guide.accessWindows.map(w => `${w.startDate} → ${w.endDate}`).join(', ');
-    console.log(`  ${status}  ${username}  (${guide.firstName} ${guide.lastName})  [${windows}]`);
-
-    if (isNew) created++; else updated++;
-  }
-
-  await client.quit();
-
-  console.log(`\n✓ Done: ${created} created, ${updated} updated.`);
-  if (created > 0) {
-    console.log('\n⚠️  Remember to send welcome emails to newly created guides with their username.');
-  }
+  await uploadToBlob(guides);
+  console.log('\n✓ Done. Restart the backend (or it will pick up guides on next start).');
 }
 
 main().catch(err => {

@@ -1,11 +1,50 @@
+/**
+ * Translation sessions — in-memory store.
+ *
+ * Sessions are short-lived (one per live tour) and only ever used by this single
+ * backend instance, so they live in a plain Map instead of Redis. A session that
+ * outlives its TTL is treated as gone (and a live tour that survives a backend
+ * restart simply has the guide press "Start Speaking" again).
+ */
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
-const { client, scanKeys } = require('../redisClient');
+
+const SESSION_TTL_MS = 46800 * 1000; // 13h (12h max session + 1h grace)
+
+const sessions = new Map();  // sessionId -> { session, expiresAt }
+const codeIndex = new Map(); // joinCode -> sessionId
+
+// Periodically purge expired sessions so the maps don't grow unbounded.
+const _sweep = setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of sessions) {
+    if (entry.expiresAt <= now) {
+      sessions.delete(id);
+      codeIndex.delete(entry.session.joinCode);
+    }
+  }
+}, 5 * 60 * 1000);
+_sweep.unref();
+
+function _store(session) {
+  sessions.set(session.id, { session, expiresAt: Date.now() + SESSION_TTL_MS });
+  codeIndex.set(session.joinCode, session.id);
+}
+
+function _read(sessionId) {
+  const entry = sessions.get(sessionId);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    sessions.delete(sessionId);
+    codeIndex.delete(entry.session.joinCode);
+    return null;
+  }
+  return entry.session;
+}
 
 /**
- * Generate a short 6-character join code using a CSPRNG (crypto) instead of
- * Math.random(). Unbiased selection over the 32-char alphabet.
+ * Generate a short 6-character join code using a CSPRNG (crypto).
  */
 function generateJoinCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Excluding confusing chars
@@ -18,16 +57,12 @@ function generateJoinCode() {
   return code;
 }
 
-/**
- * Generate a join code that is not already in use, retrying on collision.
- */
-async function generateUniqueJoinCode() {
+/** Generate a join code that is not currently in use. */
+function generateUniqueJoinCode() {
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateJoinCode();
-    const exists = await client.get(`code:${code}`);
-    if (!exists) return code;
+    if (!codeIndex.has(code)) return code;
   }
-  // Extremely unlikely; fall back to a longer code to guarantee uniqueness.
   return generateJoinCode() + generateJoinCode().slice(0, 2);
 }
 
@@ -36,7 +71,7 @@ async function generateUniqueJoinCode() {
  */
 async function createSession() {
   const sessionId = uuidv4();
-  const joinCode = await generateUniqueJoinCode();
+  const joinCode = generateUniqueJoinCode();
 
   // Generate QR code
   const joinUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/join?code=${joinCode}`;
@@ -55,10 +90,7 @@ async function createSession() {
                          'sr', 'mk', 'bg', 'hu', 'ro', 'hr', 'sl', 'sk', 'pl', 'uk']
   };
 
-  // Store in Redis with 13 hour expiration (12h max session + 1h grace)
-  await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
-  await client.setEx(`code:${joinCode}`, 46800, sessionId);
-
+  _store(session);
   console.log(`✓ Session created: ${sessionId} | Code: ${joinCode}`);
 
   return {
@@ -74,45 +106,30 @@ async function createSession() {
  * Get session by ID or join code
  */
 async function getSession(idOrCode) {
-  try {
-    // Try as session ID first
-    const sessionData = await client.get(`session:${idOrCode}`);
-    if (sessionData) {
-      return JSON.parse(sessionData);
-    }
+  const byId = _read(idOrCode);
+  if (byId) return byId;
 
-    // Try as join code
-    const sessionId = await client.get(`code:${idOrCode}`);
-    if (sessionId) {
-      const session = await client.get(`session:${sessionId}`);
-      return session ? JSON.parse(session) : null;
-    }
+  const sessionId = codeIndex.get(idOrCode);
+  if (sessionId) return _read(sessionId);
 
-    return null;
-  } catch (err) {
-    console.error('Error getting session:', err);
-    return null;
-  }
+  return null;
 }
 
 /**
  * Add listener to session
  */
 async function addListener(sessionId, connectionId, language) {
-  const session = await getSession(sessionId);
+  const session = _read(sessionId);
   if (!session) return false;
 
   if (!session.listeners[language]) {
     session.listeners[language] = [];
   }
-
   if (!session.listeners[language].includes(connectionId)) {
     session.listeners[language].push(connectionId);
   }
 
-  await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
   console.log(`✓ Listener ${connectionId} joined session ${sessionId} (${language})`);
-
   return true;
 }
 
@@ -120,19 +137,15 @@ async function addListener(sessionId, connectionId, language) {
  * Remove listener from session
  */
 async function removeListener(sessionId, connectionId, language) {
-  const session = await getSession(sessionId);
+  const session = _read(sessionId);
   if (!session) return;
 
   if (session.listeners[language]) {
     session.listeners[language] = session.listeners[language].filter(id => id !== connectionId);
-
-    // Clean up empty language arrays
     if (session.listeners[language].length === 0) {
       delete session.listeners[language];
     }
   }
-
-  await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
   console.log(`✓ Listener ${connectionId} left session ${sessionId}`);
 }
 
@@ -140,30 +153,22 @@ async function removeListener(sessionId, connectionId, language) {
  * Get all listener connection IDs for a specific language in a session
  */
 async function getListenersByLanguage(sessionId, language) {
-  const session = await getSession(sessionId);
-  if (!session || !session.listeners[language]) {
-    return [];
-  }
+  const session = _read(sessionId);
+  if (!session || !session.listeners[language]) return [];
   return session.listeners[language];
 }
 
 /**
  * Get all languages that have active listeners in a session
- * @param {string} sessionId - Session ID
- * @returns {Promise<Set<string>>} Set of language codes with active listeners
  */
 async function getSessionListenerLanguages(sessionId) {
-  const session = await getSession(sessionId);
+  const session = _read(sessionId);
   const languages = new Set();
-  
   if (session && session.listeners) {
     for (const [language, listenerIds] of Object.entries(session.listeners)) {
-      if (listenerIds && listenerIds.length > 0) {
-        languages.add(language);
-      }
+      if (listenerIds && listenerIds.length > 0) languages.add(language);
     }
   }
-  
   return languages;
 }
 
@@ -171,23 +176,18 @@ async function getSessionListenerLanguages(sessionId) {
  * Set speaker connection status
  */
 async function setSpeakerConnected(sessionId, connected) {
-  const session = await getSession(sessionId);
-  if (session) {
-    session.speakerConnected = connected;
-    await client.setEx(`session:${sessionId}`, 46800, JSON.stringify(session));
-  }
+  const session = _read(sessionId);
+  if (session) session.speakerConnected = connected;
 }
 
 /**
  * End session and cleanup
  */
 async function endSession(sessionId) {
-  const session = await getSession(sessionId);
-  if (!session) return;
-
-  await client.del(`session:${sessionId}`);
-  await client.del(`code:${session.joinCode}`);
-
+  const entry = sessions.get(sessionId);
+  if (!entry) return;
+  sessions.delete(sessionId);
+  codeIndex.delete(entry.session.joinCode);
   console.log(`✓ Session ended: ${sessionId}`);
 }
 
@@ -195,12 +195,11 @@ async function endSession(sessionId) {
  * Get session statistics
  */
 async function getSessionStats(sessionId) {
-  const session = await getSession(sessionId);
+  const session = _read(sessionId);
   if (!session) return null;
 
   let totalListeners = 0;
   const languageBreakdown = {};
-
   Object.entries(session.listeners).forEach(([language, listeners]) => {
     const count = listeners.length;
     totalListeners += count;
@@ -219,21 +218,15 @@ async function getSessionStats(sessionId) {
 }
 
 /**
- * Get all active sessions from Redis (used by watchdog)
+ * Get all active sessions (used by watchdog)
  */
 async function getAllActiveSessions() {
-  try {
-    const keys = await scanKeys('session:*');
-    const sessions = [];
-    for (const key of keys) {
-      const data = await client.get(key);
-      if (data) sessions.push(JSON.parse(data));
-    }
-    return sessions;
-  } catch (err) {
-    console.error('Error scanning sessions:', err);
-    return [];
+  const now = Date.now();
+  const out = [];
+  for (const entry of sessions.values()) {
+    if (entry.expiresAt > now) out.push(entry.session);
   }
+  return out;
 }
 
 module.exports = {

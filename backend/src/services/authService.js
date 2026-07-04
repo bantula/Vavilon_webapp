@@ -1,91 +1,119 @@
-const { client, scanKeys } = require('../redisClient');
-
 /**
- * Get today's date as YYYY-MM-DD in server local time.
- * Access windows compare against this date.
+ * Guide accounts.
+ *
+ * Source of truth is a single JSON document in Azure Blob Storage
+ * (container `guides`, blob `guides.json`), loaded into memory once at startup.
+ * There are only a handful of guides that change rarely, so an in-memory copy
+ * plus a Blob write on update is plenty — no Redis required.
+ *
+ * For local development (no AZURE_STORAGE_CONNECTION_STRING), it falls back to
+ * backend/data/guides.json and seeds Blob from it when possible.
  */
+const fs = require('fs');
+const path = require('path');
+const { getContainerClient } = require('../blob');
+
+const CONTAINER = 'guides';
+const BLOB_NAME = 'guides.json';
+const LOCAL_FILE = path.join(__dirname, '..', '..', 'data', 'guides.json');
+
+let guides = new Map(); // username -> guide object
+let readyPromise = null;
+
+/** Today's date as YYYY-MM-DD in server local time. */
 function todayLocalDate() {
-  return new Date().toLocaleDateString('en-CA'); // returns YYYY-MM-DD
+  return new Date().toLocaleDateString('en-CA');
 }
 
-/**
- * Store a guide in Redis. If the guide did not previously exist,
- * set createdAt so the caller can detect new accounts.
- *
- * @param {object} guideData - { firstName, lastName, username, email, phone, accessWindows }
- * @returns {object} { guide, isNew }
- */
+async function loadFromBlob() {
+  const client = getContainerClient(CONTAINER).getBlockBlobClient(BLOB_NAME);
+  const buf = await client.downloadToBuffer();
+  return JSON.parse(buf.toString('utf8'));
+}
+
+function loadFromLocalFile() {
+  if (fs.existsSync(LOCAL_FILE)) {
+    return JSON.parse(fs.readFileSync(LOCAL_FILE, 'utf8'));
+  }
+  return null;
+}
+
+async function saveToBlob() {
+  const client = getContainerClient(CONTAINER).getBlockBlobClient(BLOB_NAME);
+  const data = JSON.stringify([...guides.values()], null, 2);
+  await client.upload(data, Buffer.byteLength(data), {
+    blobHTTPHeaders: { blobContentType: 'application/json' }
+  });
+}
+
+async function init() {
+  let list = null;
+  try {
+    await getContainerClient(CONTAINER).createIfNotExists();
+    list = await loadFromBlob();
+    console.log(`✓ Loaded ${list.length} guide(s) from Blob`);
+  } catch (err) {
+    console.warn('Guide Blob load failed:', err.message);
+    const local = loadFromLocalFile();
+    if (local) {
+      guides = new Map(local.map(g => [g.username, g]));
+      console.log(`✓ Loaded ${local.length} guide(s) from local data/guides.json`);
+      // Best-effort seed to Blob so the deployed backend has the data.
+      try { await saveToBlob(); console.log('✓ Seeded guides.json to Blob'); }
+      catch (e) { console.warn('Could not seed guides to Blob:', e.message); }
+      return;
+    }
+    console.warn('No guide source available — starting with 0 guides');
+    list = [];
+  }
+  guides = new Map((list || []).map(g => [g.username, g]));
+}
+
+/** Kick off (or reuse) the one-time load. All reads await this. */
+function ready() {
+  if (!readyPromise) readyPromise = init();
+  return readyPromise;
+}
+
 async function upsertGuide(guideData) {
-  const key = `guide:${guideData.username}`;
-  const existing = await client.get(key);
+  await ready();
+  const key = guideData.username;
+  const existing = guides.get(key);
   const isNew = !existing;
 
   const guide = {
-    ...(existing ? JSON.parse(existing) : {}),
+    ...(existing || {}),
     ...guideData,
     updatedAt: new Date().toISOString(),
     ...(isNew ? { createdAt: new Date().toISOString() } : {})
   };
 
-  await client.set(key, JSON.stringify(guide));
-  console.log(`✓ Guide ${isNew ? 'created' : 'updated'}: ${guideData.username}`);
+  guides.set(key, guide);
+  await saveToBlob();
+  console.log(`✓ Guide ${isNew ? 'created' : 'updated'}: ${key}`);
   return { guide, isNew };
 }
 
-/**
- * Retrieve a guide by username.
- */
 async function getGuide(username) {
-  const data = await client.get(`guide:${username}`);
-  return data ? JSON.parse(data) : null;
+  await ready();
+  return guides.get(username) || null;
 }
 
-/**
- * List all guides (scans Redis for guide:* keys).
- */
 async function listGuides() {
-  const keys = await scanKeys('guide:*');
-  if (!keys.length) return [];
-
-  const values = await Promise.all(keys.map(k => client.get(k)));
-  return values.map(v => JSON.parse(v));
+  await ready();
+  return [...guides.values()];
 }
 
-/**
- * Check whether a guide has access today.
- *
- * @param {string} username
- * @returns {{ found: boolean, guide?: object, hasAccessToday?: boolean, scheduledWindows?: Array }}
- */
 async function checkAccess(username) {
-  const guide = await getGuide(username);
-
-  if (!guide) {
-    return { found: false };
-  }
+  await ready();
+  const guide = guides.get(username);
+  if (!guide) return { found: false };
 
   const today = todayLocalDate();
   const windows = guide.accessWindows || [];
+  const hasAccessToday = windows.some(w => today >= w.startDate && today <= w.endDate);
 
-  const hasAccessToday = windows.some(
-    w => today >= w.startDate && today <= w.endDate
-  );
-
-  return {
-    found: true,
-    guide,
-    hasAccessToday,
-    scheduledWindows: windows
-  };
+  return { found: true, guide, hasAccessToday, scheduledWindows: windows };
 }
 
-/**
- * Retrieve an agency's subscription record by normalised agency name.
- * Used by the auth route to gate guide access by subscription status.
- */
-async function getAgencySubscription(agencyName) {
-  const data = await client.get(`agency:${agencyName}`);
-  return data ? JSON.parse(data) : null;
-}
-
-module.exports = { upsertGuide, getGuide, listGuides, checkAccess, getAgencySubscription };
+module.exports = { ready, upsertGuide, getGuide, listGuides, checkAccess };

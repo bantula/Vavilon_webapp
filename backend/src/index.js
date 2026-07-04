@@ -18,12 +18,10 @@ const broadcastRoutes = require('./routes/broadcast');
 const eventsRoutes = require('./routes/events');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
-const paytenRoutes = require('./routes/payten');
 const leadsRoutes  = require('./routes/leads');
+const authService = require('./services/authService');
 const { setupWebSocket, connections } = require('./websocket/wsHandler');
 const { startWatchdog } = require('./services/watchdogService');
-const { execFile } = require('child_process');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -51,7 +49,6 @@ app.use('/api/broadcast', broadcastRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api', paytenRoutes);
 app.use('/api', leadsRoutes);
 
 // Health check
@@ -59,15 +56,11 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'vavilon-backend' });
 });
 
-// Auto-import guides from guides.csv into Redis on every startup
-const importScript = path.join(__dirname, '..', 'scripts', 'import-guides.js');
-execFile(process.execPath, [importScript], { env: process.env }, (err, stdout, stderr) => {
-  if (err) {
-    console.error('Guide import failed:', stderr || err.message);
-  } else {
-    console.log('✓ Guides imported from CSV\n' + stdout.trim());
-  }
-});
+// Preload guide accounts from Blob (falls back to local data/guides.json) so
+// the first login doesn't race the initial load.
+authService.ready()
+  .then(() => console.log('✓ Guides loaded'))
+  .catch((err) => console.error('Guide load failed:', err.message));
 
 // Setup WebSocket
 setupWebSocket(server);
